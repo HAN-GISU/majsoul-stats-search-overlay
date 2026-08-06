@@ -1,0 +1,8 @@
+# 개인 설정/로그/결과물 (공유 금지)
+overlay-pos.json
+scan-log.txt
+scan-result.json
+report-result.json
+report-*.png
+*.zip
+install-ocr-zh.ps1
