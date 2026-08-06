@@ -6,3 +6,4 @@ report-result.json
 report-*.png
 *.zip
 install-ocr-zh.ps1
+scan-box.json

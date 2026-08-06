@@ -1,6 +1,6 @@
 ﻿# ═══════════════════════════════════════════════════════════
 #  작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
-#  v1.0.0  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
+#  v1.0.1  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
 #  데이터: amae-koromo(雀魂牌谱屋) 공개 API — 게임에 개입하지 않음
 # ═══════════════════════════════════════════════════════════
 
@@ -8,7 +8,7 @@
 $Nickname        = '여기에닉네임'    # 본인 닉네임 (오버레이 ⚙ 설정에서도 변경 가능)
 $PlayerId        = 0                # 0이면 닉네임으로 자동 검색
 $Modes           = '16.15.12.11.9.8' # 집계할 방: 8=금동 9=금남 11=옥동 12=옥남 15=왕좌동 16=왕좌남
-$RefreshSeconds  = 30               # 내 전적 자동 갱신 주기(초), 최소 15초
+$RefreshSeconds  = 60               # 내 전적 자동 갱신 주기(초), 최소 15초
 $AutoScanMinutes = 0                # 상대 자동 스캔 주기(분), 0이면 자동 스캔 끄기 (F8로 수동)
 # 단축키: F8 = 지금 화면 스캔해서 상대 전적 띄우기, F7 = 상대 박스 모두 닫기
 # ================================================
@@ -58,11 +58,12 @@ $script:OppWindows = @{}  # id -> WPF 창
 
 function Get-RangeStats {
     param($Id, $StartMs, $EndMs)
-    foreach ($try in 1..2) {
+    foreach ($try in 1..3) {
         try {
             return Invoke-RestMethod -Uri "$Api/player_stats/$Id/$StartMs/$EndMs`?mode=$($script:Modes)" -TimeoutSec 15
         } catch {
-            Start-Sleep -Milliseconds 400
+            # 속도 제한(429/530) 대비 점진적 대기
+            Start-Sleep -Milliseconds (500 * $try)
         }
     }
     return $null
@@ -864,23 +865,37 @@ function Get-FullTokens {
     return $out
 }
 
-# 상대 명패 위치(좌/상단/우) 3배 확대 정밀 스캔
+# 상대 명패 정밀 스캔 - 좁은 영역을 크게 확대할수록 인식률이 크게 오름
 function Get-PlateTokens {
-    param($Bmp)
+    param($Bmp, [int]$Pass = 0)
     $out = New-Object Collections.ArrayList
+    # @(x, y, w, h, 확대배율) - 이름표 주변만 좁게 자른 고배율 + 여유 있는 저배율(위치 오차 대비)
     $bands = @(
-        @(0.00, 0.28, 0.18, 0.20),  # 왼쪽 명패
-        @(0.60, 0.06, 0.32, 0.18),  # 상단(대면) 명패
-        @(0.80, 0.28, 0.20, 0.20)   # 오른쪽 명패
+        @(0.000, 0.29, 0.15, 0.12, 8.0),   # 왼쪽 이름표 (정밀)
+        @(0.66,  0.07, 0.24, 0.12, 8.0),   # 상단 이름표 (정밀)
+        @(0.85,  0.29, 0.15, 0.12, 8.0),   # 오른쪽 이름표 (정밀)
+        @(0.15,  0.74, 0.22, 0.14, 8.0),   # 하단(내 자리) 이름표 - 관전 시 4번째 플레이어 (정밀)
+        @(0.00,  0.22, 0.24, 0.28, 4.0),   # 왼쪽 (광역)
+        @(0.58,  0.03, 0.38, 0.22, 4.0),   # 상단 (광역)
+        @(0.76,  0.22, 0.24, 0.28, 4.0),   # 오른쪽 (광역)
+        @(0.10,  0.70, 0.32, 0.20, 4.0)    # 하단 (광역)
     )
+    # 1차 시도는 정밀(고배율) 밴드만 - 빠르게. 이후 시도에서 광역 밴드까지 확장
+    if ($Pass -eq 0) { $bands = @($bands | Where-Object { [double]$_[4] -ge 6.0 }) }
     foreach ($bd in $bands) {
         $rx = [int]($Bmp.Width * $bd[0]); $ry = [int]($Bmp.Height * $bd[1])
         $rw = [int]($Bmp.Width * $bd[2]); $rh = [int]($Bmp.Height * $bd[3])
+        if ($rx -lt 0) { $rx = 0 }
+        if ($ry -lt 0) { $ry = 0 }
         if ($rx + $rw -gt $Bmp.Width) { $rw = $Bmp.Width - $rx }
         if ($ry + $rh -gt $Bmp.Height) { $rh = $Bmp.Height - $ry }
+        if ($rw -le 0 -or $rh -le 0) { continue }
         try {
             $crop = $Bmp.Clone((New-Object Drawing.Rectangle $rx, $ry, $rw, $rh), $Bmp.PixelFormat)
-            $z = 3.0
+            $z = [double]$bd[4]
+            $maxDim = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
+            $lim = [math]::Min($maxDim / [math]::Max(1, $crop.Width), $maxDim / [math]::Max(1, $crop.Height))
+            if ($z -gt $lim) { $z = $lim }
             $big = New-ResizedBitmap $crop $z
             $crop.Dispose()
             foreach ($t in (Invoke-OcrBitmap $big)) {
@@ -893,7 +908,11 @@ function Get-PlateTokens {
 }
 
 $StopWords = @('랭크','전적','점수','평균순위','화료','방총','후로','칭호없음','로딩','불러오기','오버레이',
-               '반장전','동장전','금의','옥의','왕좌의','은의','동의','금탁','친선전','단위전','대회전','관전')
+               '반장전','동장전','금의','옥의','왕좌의','은의','동의','금탁','친선전','단위전','대회전','관전',
+               '동풍전','금의방','옥의방','왕좌의방','은의방','동의방','승격전','최종순위','종국','유국','오라스',
+               '연장전','시합종료','정산','획득','합계','리치','쯔모','론','더블론','유국만관','최종성적',
+               'MAKA','BETA','패보','패보재생','패산','등급전','잔여분석횟수','즐겨찾기','전체평점','이번평점',
+               '텐파이표시','사용중','툴바','분기점','이전분기점으로','다음분기점으로','대국시작','기타패보')
 
 $script:GoalOptions = @(0, 50, 100, 150, 200, 300, 500)
 $script:MinNOptions = @(0, 10, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000)
@@ -912,6 +931,7 @@ $script:HandakuMap = @{
 $script:KanaLookalike = @{
     '厶' = 'ム'; '示' = 'ポ'; '工' = 'エ'; '力' = 'カ'; '口' = 'ロ'
     '夕' = 'タ'; '卜' = 'ト'; '二' = 'ニ'; '八' = 'ハ'; 'L' = 'ム'
+    '才' = 'オ'; '一' = 'ー'; '-' = 'ー'; '―' = 'ー'; '─' = 'ー'; '亍' = 'テ'
 }
 
 # 가나 혼동 교정: OCR 전형 방향(큰→작은 가나, 무탁점→탁점) 일괄 치환용 맵과 양방향 대안 맵
@@ -922,7 +942,9 @@ foreach ($pr in @('アァ', 'イィ', 'ウゥ', 'エェ', 'オォ', 'ヤャ', '�
                   'カガ', 'キギ', 'クグ', 'ケゲ', 'コゴ', 'サザ', 'シジ', 'スズ', 'セゼ', 'ソゾ',
                   'タダ', 'チヂ', 'テデ', 'トド', 'ハバ', 'ヒビ', 'フブ', 'ヘベ', 'ホボ',
                   'かが', 'きぎ', 'くぐ', 'けげ', 'こご', 'さざ', 'しじ', 'すず', 'せぜ', 'そぞ',
-                  'ただ', 'ちぢ', 'てで', 'とど', 'はば', 'ひび', 'ふぶ', 'へべ', 'ほぼ')) {
+                  'ただ', 'ちぢ', 'てで', 'とど', 'はば', 'ひび', 'ふぶ', 'へべ', 'ほぼ',
+                  'バパ', 'ビピ', 'ブプ', 'ベペ', 'ボポ', 'ばぱ', 'びぴ', 'ぶぷ', 'べぺ', 'ぼぽ',
+                  'ハパ', 'ヒピ', 'フプ', 'ヘペ', 'ホポ', 'はぱ', 'ひぴ', 'ふぷ', 'へぺ', 'ほぽ')) {
     $a = [string]$pr[0]; $b = [string]$pr[1]
     $script:KanaFix[$a] = $b
     if (-not $script:KanaAlt.ContainsKey($a)) { $script:KanaAlt[$a] = @() }
@@ -934,59 +956,93 @@ foreach ($pr in @('アァ', 'イィ', 'ウゥ', 'エェ', 'オォ', 'ヤャ', '�
 function Get-TokenVariants {
     param([string]$Raw, [bool]$Deep = $false)
     $variants = New-Object Collections.ArrayList
-    $null = $variants.Add($Raw)
     try {
-        # 앞뒤 구두점 제거 변형 (예: .巡kamiku → 巡kamiku)
-        $trimChars = [char[]]@('.', ',', [char]0xB7, "'", '|', '~', '-', '_', '/', '\', '(', ')', '[', ']', '{', '}', '<', '>', '!', ':', ';', '"', [char]0x60, [char]0x2018, [char]0x2019)
+        $trimChars = [char[]]@('.', ',', [char]0xB7, "'", '|', '~', '-', '_', '/', [char]0x5C, '(', ')', '[', ']', '{', '}', '<', '>', '!', ':', ';', '"', [char]0x60, [char]0x2018, [char]0x2019,
+                               [char]0x3001, [char]0x3002, [char]0xFF0C, [char]0xFF61, [char]0xFF64, [char]0x30FB)
+        # 원본과 "앞뒤 구두점 제거본" 양쪽에 모든 보정을 적용
+        $bases = New-Object Collections.ArrayList
+        $null = $bases.Add($Raw)
         $trimmed = $Raw.Trim($trimChars)
-        if ($trimmed -and $trimmed -ne $Raw -and $variants -notcontains $trimmed) { $null = $variants.Add($trimmed) }
-        $fixed = [regex]::Replace($Raw, '([はひふへほハヒフヘホ])[。゜°]', {
-            param($m) $script:HandakuMap[$m.Groups[1].Value]
-        })
-        if ($fixed -ne $Raw) { $null = $variants.Add($fixed) }
-        # 숫자 0 ↔ 문자 o/O 혼동 보정 (예: masay04 → masayo4)
-        if ($Raw -match '0' -and $Raw -match '[A-Za-z]') {
-            foreach ($v in @($Raw.Replace('0', 'o'), $Raw.Replace('0', 'O'))) {
-                if ($v -ne $Raw -and $variants -notcontains $v) { $null = $variants.Add($v) }
-            }
-        }
-        # CJK가 섞인 토큰: 가타카나 혼동 글자 보정 변형 추가 (예: 示厶地 → ポム地)
-        if ($Raw -match '[぀-ヿ一-鿿]') {
-            $kana = $Raw
-            foreach ($k in @($script:KanaLookalike.Keys)) { $kana = $kana.Replace($k, $script:KanaLookalike[$k]) }
-            if ($kana -ne $Raw -and $variants -notcontains $kana) { $null = $variants.Add($kana) }
-            $kana2 = [regex]::Replace($kana, '([はひふへほハヒフヘホ])[。゜°]', {
+        if ($trimmed -and $trimmed -ne $Raw) { $null = $bases.Add($trimmed) }
+
+        foreach ($base in $bases) {
+            if ($variants -notcontains $base) { $null = $variants.Add($base) }
+
+            # 반탁점 오인식 (ほ。→ ぽ)
+            $fixed = [regex]::Replace($base, '([はひふへほハヒフヘホ])[。゜°]', {
                 param($m) $script:HandakuMap[$m.Groups[1].Value]
             })
-            if ($kana2 -ne $kana -and $variants -notcontains $kana2) { $null = $variants.Add($kana2) }
-        }
-        # 명패 토큰 한정: 가나 크기/탁점 혼동 교정 (예: リインテュノア → リィンデュノア)
-        if ($Deep -and $Raw -match '[ぁ-ゖァ-ヺ]') {
-            $chars = $Raw.ToCharArray()
-            $positions = @()
-            for ($i = 0; $i -lt $chars.Count; $i++) {
-                if ($script:KanaAlt.ContainsKey([string]$chars[$i])) { $positions += $i }
+            if ($fixed -ne $base -and $variants -notcontains $fixed) { $null = $variants.Add($fixed) }
+
+            # 한자/라틴으로 잘못 읽힌 가나 보정 (示厶地 → ポム地, 才一 → オー)
+            $kana = $base
+            if ($base -match '[぀-ヿ一-鿿]') {
+                foreach ($k in @($script:KanaLookalike.Keys)) { $kana = $kana.Replace($k, $script:KanaLookalike[$k]) }
+                if ($kana -ne $base -and $variants -notcontains $kana) { $null = $variants.Add($kana) }
             }
-            if ($positions.Count -gt 0 -and $positions.Count -le 5) {
-                # 전형 방향 일괄 치환 (큰→작은, 무탁점→탁점)
-                $comb = [char[]]$chars.Clone()
-                $changed = $false
-                foreach ($pos in $positions) {
-                    $c = [string]$chars[$pos]
-                    if ($script:KanaFix.ContainsKey($c)) { $comb[$pos] = ([string]$script:KanaFix[$c])[0]; $changed = $true }
-                }
-                if ($changed) {
-                    $v = -join $comb
-                    if ($variants -notcontains $v) { $null = $variants.Add($v) }
-                }
-                # 단일 치환 변형 (양방향)
-                foreach ($pos in $positions) {
-                    foreach ($alt in $script:KanaAlt[[string]$chars[$pos]]) {
-                        $one = [char[]]$chars.Clone()
-                        $one[$pos] = ([string]$alt)[0]
-                        $v = -join $one
+
+            # 명패 토큰: 가나 크기/탁점·반탁점 혼동 보정 (リインテュノア → リィンデュノア, おリープ → おリーブ)
+            if ($Deep) {
+                foreach ($src in @($base, $kana, $fixed)) {
+                    if (-not $src -or $src -notmatch '[ぁ-ゖァ-ヺ]') { continue }
+                    $chars = $src.ToCharArray()
+                    $positions = @()
+                    for ($i = 0; $i -lt $chars.Count; $i++) {
+                        if ($script:KanaAlt.ContainsKey([string]$chars[$i])) { $positions += $i }
+                    }
+                    if ($positions.Count -eq 0 -or $positions.Count -gt 5) { continue }
+                    # 전형 방향 일괄 치환 (큰→작은 가나, 무탁점→탁점)
+                    $comb = [char[]]$chars.Clone()
+                    $changed = $false
+                    foreach ($pos in $positions) {
+                        $c = [string]$chars[$pos]
+                        if ($script:KanaFix.ContainsKey($c)) { $comb[$pos] = ([string]$script:KanaFix[$c])[0]; $changed = $true }
+                    }
+                    if ($changed) {
+                        $v = -join $comb
                         if ($variants -notcontains $v) { $null = $variants.Add($v) }
                     }
+                    # 한 글자씩 양방향 치환
+                    foreach ($pos in $positions) {
+                        foreach ($alt in $script:KanaAlt[[string]$chars[$pos]]) {
+                            $one = [char[]]$chars.Clone()
+                            $one[$pos] = ([string]$alt)[0]
+                            $v = -join $one
+                            if ($variants -notcontains $v) { $null = $variants.Add($v) }
+                        }
+                    }
+                }
+            }
+
+            # 숫자 0 ↔ 문자 o/O 혼동 (masay04 → masayo4)
+            if ($base -match '0' -and $base -match '[A-Za-z]') {
+                foreach ($v in @($base.Replace('0', 'o'), $base.Replace('0', 'O'))) {
+                    if ($variants -notcontains $v) { $null = $variants.Add($v) }
+                }
+            }
+            # 순위 마커 제거 (1위天然水 → 天然水)
+            if ($base -match '^[1-4](위|位)') {
+                $v = $base -replace '^[1-4](위|位)', ''
+                if ($v -and $v.Length -ge 2 -and $variants -notcontains $v) { $null = $variants.Add($v) }
+            }
+            # 순위 배지 잡음 제거: 앞머리 숫자(+기호 1글자) 떼기 (1爿天然水 → 天然水)
+            if ($base -match '^\d') {
+                foreach ($v in @(($base -replace '^\d+', ''), ($base -replace '^\d+[^0-9]', ''))) {
+                    if ($v -and $v.Length -ge 2 -and $variants -notcontains $v) { $null = $variants.Add($v) }
+                }
+            }
+            # 물결표 정규화: OCR의 ASCII ~ → 닉네임의 전각 물결 (貞~照 → 貞〜照)
+            if ($base.Contains('~')) {
+                foreach ($v in @($base.Replace('~', [string][char]0x301C), $base.Replace('~', [string][char]0xFF5E))) {
+                    if ($variants -notcontains $v) { $null = $variants.Add($v) }
+                }
+            }
+            # 라틴 혼동: l ↔ I ↔ 1 ↔ | (CompiIingjay → Compilingjay)
+            if ($base -match '[A-Za-z]') {
+                foreach ($v in @($base.Replace('I', 'l'), $base.Replace('l', 'I'),
+                                 $base.Replace('|', 'l'), $base.Replace('|', 'I'),
+                                 $base.Replace('1', 'l'), $base.Replace([string][char]0x300D, ''))) {
+                    if ($v -and $v -ne $base -and $variants -notcontains $v) { $null = $variants.Add($v) }
                 }
             }
         }
@@ -994,63 +1050,181 @@ function Get-TokenVariants {
     return $variants
 }
 
-# 토큰 목록에서 실존 플레이어를 찾아 $FoundMap(id -> 정보)에 추가
+# 두 문자열의 유사도 (레벤슈타인 기반, 0~1)
+function Get-StrSimilarity {
+    param([string]$A, [string]$B)
+    if (-not $A -or -not $B) { return 0.0 }
+    $n = $A.Length; $m = $B.Length
+    $prev = New-Object 'int[]' ($m + 1)
+    $cur = New-Object 'int[]' ($m + 1)
+    for ($j = 0; $j -le $m; $j++) { $prev[$j] = $j }
+    for ($i = 1; $i -le $n; $i++) {
+        $cur[0] = $i
+        for ($j = 1; $j -le $m; $j++) {
+            $cost = 1
+            if ($A[$i - 1] -eq $B[$j - 1]) { $cost = 0 }
+            $cur[$j] = [math]::Min([math]::Min($cur[$j - 1] + 1, $prev[$j] + 1), $prev[$j - 1] + $cost)
+        }
+        [array]::Copy($cur, $prev, $m + 1)
+    }
+    $dist = $prev[$m]
+    $mx = [math]::Max($n, $m)
+    return (1.0 - ($dist / $mx))
+}
+
+# 앞 2글자를 접두사로 검색해 가장 비슷한 실존 닉을 찾음 (OCR이 뒷부분을 뭉갠 경우 구제)
+function Find-ByPrefix {
+    param([string]$Raw)
+    if ($Raw.Length -lt 3 -or $Raw.Length -gt 16) { return $false }
+    $pre = $Raw.Substring(0, 2)
+    if ($pre -notmatch '^[぀-ヿ一-鿿]{2}$') {
+        # 2번째 글자가 비CJK(오인식 기호 등)면 첫 글자만으로 검색 (貞~照 → 貞)
+        if ($Raw.Substring(0, 1) -match '^[぀-ヿ一-鿿]$') { $pre = $Raw.Substring(0, 1) }
+        else { return $false }
+    }
+    $ck = "pre:$pre"
+    if (-not $script:NickCache.ContainsKey($ck)) {
+        if ($script:ScanQueryLeft -le 0) { return $false }
+        $script:ScanQueryLeft--
+        try {
+            Start-Sleep -Milliseconds 150
+            $script:NickCache[$ck] = @(Invoke-RestMethod -Uri "$Api/search_player/$([uri]::EscapeDataString($pre))?limit=100" -TimeoutSec 10)
+        } catch { return $false }
+    }
+    $cands = @($script:NickCache[$ck])
+    $cutoff = [DateTimeOffset]::UtcNow.AddDays(-60).ToUnixTimeMilliseconds()
+    $best = $null; $bestS = 0.0; $secondS = 0.0
+    foreach ($c in $cands) {
+        if ($null -eq $c -or $c -is [array]) { continue }
+        $nick = $c.nickname -as [string]
+        if (-not $nick) { continue }
+        $ts = $c.latest_timestamp -as [long]
+        if ($null -eq $ts -or ($ts * 1000) -le $cutoff) { continue }
+        if ([math]::Abs($nick.Length - $Raw.Length) -gt 2) { continue }
+        $sim = Get-StrSimilarity $Raw $nick
+        if ($sim -gt $bestS) { $secondS = $bestS; $bestS = $sim; $best = $c }
+        elseif ($sim -gt $secondS) { $secondS = $sim }
+    }
+    # 충분히 비슷하고, 2등과 확실히 차이날 때만 채택
+    if ($best -and $bestS -ge 0.55 -and ($bestS - $secondS) -ge 0.08) {
+        $null = $script:ScanLog.Add(">>> 유사매칭: $Raw -> $($best.nickname) ({0:N2})" -f $bestS)
+        return $best.id
+    }
+    return $false
+}
+
+# 후보 닉네임으로서 그럴듯한지 (OCR 잡음 걸러내기)
+function Test-NickPlausible {
+    param([string]$T)
+    if ($T -match '^[\d.,:%/()\-±▲▼xX×*·。、]+$') { return $false }
+    if ($T -imatch '^([a-z0-9])+$') { return $false }
+    # 한글 + 라틴/숫자 혼합은 대부분 OCR 잡음
+    if ($T -match '[가-힣]' -and $T -match '[A-Za-z0-9]') { return $false }
+    # 숫자·기호 비중이 과반이면 잡음
+    $bad = ([regex]::Matches($T, '[\d.,:%/()\-_|~`]')).Count
+    if ($bad * 2 -gt $T.Length) { return $false }
+    return $true
+}
+
 function Resolve-Tokens {
-    param($Tokens, $FoundMap)
+    param($Tokens, $FoundMap, [bool]$NoCenter = $false)
     $myNick = $script:Nickname
     $seen = @{}
     $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+
+    # 1) 후보 정리 - 중복 제거 (중앙 필터는 순위 화면 감지 후 적용)
+    $cands = New-Object Collections.ArrayList
+    $dedup = @{}
+    $hasRank = $false
     foreach ($tk in $Tokens) {
         $raw = ($tk.Text -replace '\s', '')
         if ($raw) { $null = $script:ScanLog.Add($raw) }
-        # 화면 중앙(패산·점수판)에는 명패가 없음 - 중앙 토큰은 오탐이므로 제외
-        if ($tk.X -gt $b.Width * 0.30 -and $tk.X -lt $b.Width * 0.70 -and
-            $tk.Y -gt $b.Height * 0.28 -and $tk.Y -lt $b.Height * 0.72) { continue }
-
-        # 3명이 찼으면 교체 후보(기존 위치 근처 + 더 긴 토큰)만 검사 (쿼리 절약)
-        if ($FoundMap.Count -ge 3) {
-            $rNear = $null
-            foreach ($kv in @($FoundMap.GetEnumerator())) {
-                if ([math]::Abs([double]$kv.Value.X - [double]$tk.X) -lt 240 -and [math]::Abs([double]$kv.Value.Y - [double]$tk.Y) -lt 60) {
-                    $rNear = $kv.Key
-                    break
-                }
-            }
-            if ($null -eq $rNear) { continue }
-            if ($raw.Length -le ([string]$FoundMap[$rNear].Nick).Length) { continue }
+        if (-not $raw -or $raw.Length -lt 2 -or $raw.Length -gt 20) { continue }
+        $r = $script:MyBoxRect
+        if ($r -and $tk.X -ge $r.X1 -and $tk.X -le $r.X2 -and $tk.Y -ge $r.Y1 -and $tk.Y -le $r.Y2) { continue }
+        if ($raw -eq $myNick) { $script:SawMyNick = $true }
+        $rk = ($raw -match '^[1-4](위|位)')
+        if ($rk) {
+            $hasRank = $true
+            if (($raw -replace '^[1-4](위|位)', '') -eq $myNick) { $script:SawMyNick = $true }
         }
+        if ($dedup.ContainsKey($raw)) { continue }
+        $dedup[$raw] = $true
+        $null = $cands.Add(@{ Raw = $raw; X = $tk.X; Y = $tk.Y; Src = [string]$tk.Src; Rk = $rk })
+    }
 
-        foreach ($t in (Get-TokenVariants $raw (([string]$tk.Src) -eq 'p'))) {
-            # 최소 길이: 명패 위치에서 읽힌 토큰은 2글자부터 (위치가 신뢰 근거),
-            # 전체 화면 토큰은 한자/가나 2글자·그 외 4글자부터 (노이즈 조각 방지)
+    # 순위 화면('N위' 마커)이 아니면 중앙(패산) 토큰 제외
+    if (-not $NoCenter -and -not $hasRank) {
+        $cands = @($cands | Where-Object {
+            -not ($_.X -gt $b.Width * 0.30 -and $_.X -lt $b.Width * 0.70 -and
+                  $_.Y -gt $b.Height * 0.28 -and $_.Y -lt $b.Height * 0.72)
+        })
+    }
+    # 순위 화면이면: 화면 맨 위의 순위 묶음(열린 팝업/결과)만 취급 - 뒤에 비치는 다른 판 목록 배제
+    if ($hasRank) {
+        $minY = [double]::MaxValue
+        foreach ($cd in $cands) { if ($cd.Rk -and [double]$cd.Y -lt $minY) { $minY = [double]$cd.Y } }
+        $cands = @($cands | Where-Object { $_.Rk -and ([double]$_.Y - $minY) -lt ($b.Height * 0.18) })
+    }
+
+    # 2) 우선순위: 순위 화면이면 'N위' 붙은 이름을 화면 위쪽(열린 팝업)부터,
+    #    아니면 명패 토큰 → 긴 토큰 (조회 예산을 값어치 있는 곳에)
+    if ($hasRank) {
+        $ordered = @($cands | Sort-Object @{ Expression = { if ($_.Rk) { 0 } else { 1 } } }, @{ Expression = { $_.Y } }, @{ Expression = { -($_.Raw.Length) } })
+    } else {
+        $ordered = @($cands | Sort-Object @{ Expression = { if ($_.Src -eq 'p') { 0 } else { 1 } } }, @{ Expression = { -($_.Raw.Length) } })
+    }
+
+    foreach ($tk in $ordered) {
+        $raw = [string]$tk.Raw
+        try {
+
+        # 이미 확정된 명패 근처의 토큰은 더 긴(완전한) 닉일 때만 진행 - 조회 예산 절약
+        $preNear = $null
+        foreach ($kv in @($FoundMap.GetEnumerator())) {
+            if ([math]::Abs([double]$kv.Value.X - [double]$tk.X) -lt 240 -and [math]::Abs([double]$kv.Value.Y - [double]$tk.Y) -lt 60) {
+                $preNear = $kv.Key
+                break
+            }
+        }
+        if ($null -ne $preNear -and $raw.Length -le ([string]$FoundMap[$preNear].Nick).Length) { continue }
+        # 정원이 찼는데 교체 후보(근처)도 아니면 종료 대상
+        if ($FoundMap.Count -ge 4 -and $null -eq $preNear) { continue }
+
+        # 가나가 포함된 토큰은 출처와 무관하게 정밀 보정 (이름일 가능성이 높음)
+        $deep = (($tk.Src -eq 'p') -or ($raw -match '[ぁ-ゖァ-ヺ]'))
+        foreach ($t in (Get-TokenVariants $raw $deep)) {
+            # 최소 길이: 한자/가나 2글자, 명패 라틴 3글자, 그 외 4글자
             $minLen = 4
-            if (([string]$tk.Src) -eq 'p') { $minLen = 2 }
-            elseif ($t -match '[぀-ヿ一-鿿]') { $minLen = 2 }
+            if ($t -match '[぀-ヿ一-鿿]') { $minLen = 2 }
+            elseif ($tk.Src -eq 'p') { $minLen = 3 }
             if ($t.Length -lt $minLen -or $t.Length -gt 16) { continue }
-            if ($t -eq $myNick) { continue }
-            if ($t -match '^[\d.,:%/()\-±▲▼xX×*]+$') { continue }
-            if ($t -imatch '^([a-z0-9])\1+$') { continue }   # 같은 글자 반복 (패 뒷면 노이즈 오탐 방지, 예: GGGggg)
+            if ($t -eq $myNick) { $script:SawMyNick = $true; continue }
             if ($StopWords -contains $t) { continue }
+            if (-not (Test-NickPlausible $t)) { continue }
             if ($seen.ContainsKey($t)) { continue }
             $seen[$t] = $true
 
             if (-not $script:NickCache.ContainsKey($t)) {
+                # 조회 예산 초과 시 새 조회는 생략 (속도 제한 방지)
+                if ($script:ScanQueryLeft -le 0) { continue }
+                $script:ScanQueryLeft--
                 try {
-                    Start-Sleep -Milliseconds 100
+                    Start-Sleep -Milliseconds 150
                     $res = Invoke-RestMethod -Uri "$Api/search_player/$([uri]::EscapeDataString($t))?limit=5" -TimeoutSec 10
                     $id = $false
-                    # 후보 순서: 대소문자 정확 일치 → 대소문자 무시 일치(최근 활동 순).
-                    # 정확 일치 계정이 휴면이면 다음 후보로 넘어간다 (예: 赤木茂v(휴면) vs 赤木茂V(현역))
-                    $cands = @($res | Where-Object { $_.nickname -ceq $t })
-                    $cands += @($res | Where-Object { $_.nickname -ieq $t -and $_.nickname -cne $t } | Sort-Object latest_timestamp -Descending)
+                    # 후보 순서: 대소문자 정확 일치 → 대소문자 무시 일치(최근 활동 순)
+                    $hits = @($res | Where-Object { $_.nickname -ceq $t })
+                    $hits += @($res | Where-Object { $_.nickname -ieq $t -and $_.nickname -cne $t } | Sort-Object latest_timestamp -Descending)
                     $cutoff = [DateTimeOffset]::UtcNow.AddDays(-60).ToUnixTimeMilliseconds()
-                    foreach ($h in $cands) {
-                        # 최근 60일 내 대국 기록이 있는 플레이어만 (오인식 필터)
-                        if (([long]$h.latest_timestamp * 1000) -gt $cutoff) { $id = $h.id; break }
+                    foreach ($h in $hits) {
+                        $hts = $h.latest_timestamp -as [long]
+                        if ($null -ne $hts -and ($hts * 1000) -gt $cutoff) { $id = $h.id; break }
                     }
-                    # 조회가 성공했을 때만 결과를 캐시 (네트워크 오류가 미스로 굳는 것 방지)
                     $script:NickCache[$t] = $id
-                } catch {}
+                } catch {
+                    $script:ScanLog.Add("!! 조회 실패: $t") | Out-Null
+                }
             }
             $id = $false
             if ($script:NickCache.ContainsKey($t)) { $id = $script:NickCache[$t] }
@@ -1066,7 +1240,7 @@ function Resolve-Tokens {
                         }
                     }
                     if ($null -eq $nearKey) {
-                        if ($FoundMap.Count -lt 3) {
+                        if ($FoundMap.Count -lt 4) {
                             $FoundMap[$key] = @{ Id = $id; Nick = $t; X = $tk.X; Y = $tk.Y }
                             $null = $script:ScanLog.Add(">>> 매칭: $t (id $id)")
                         }
@@ -1081,6 +1255,26 @@ function Resolve-Tokens {
                 break
             }
         }
+
+        # 변형으로도 못 찾았고 명패에서 읽힌 CJK 토큰이면 접두사 유사매칭 시도
+        if ($tk.Src -eq 'p' -and $raw -match '^[぀-ヿ一-鿿]{2}') {
+            $already = $false
+            foreach ($kv in @($FoundMap.GetEnumerator())) {
+                if ([math]::Abs([double]$kv.Value.X - [double]$tk.X) -lt 240 -and [math]::Abs([double]$kv.Value.Y - [double]$tk.Y) -lt 60) { $already = $true; break }
+            }
+            if (-not $already -and $FoundMap.Count -lt 4) {
+                $fid = Find-ByPrefix $raw
+                if ($fid) {
+                    $fkey = "$fid"
+                    if (-not $FoundMap.ContainsKey($fkey)) {
+                        $FoundMap[$fkey] = @{ Id = $fid; Nick = $raw; X = $tk.X; Y = $tk.Y }
+                    }
+                }
+            }
+        }
+        } catch {
+            $null = $script:ScanLog.Add("!! 토큰 처리 오류: $raw - $($_.Exception.Message)")
+        }
     }
 }
 
@@ -1088,19 +1282,52 @@ function Resolve-Tokens {
 function Scan-Opponents {
     if (-not $script:OcrOk) { return @() }
     $script:ScanLog = New-Object Collections.ArrayList
+    $script:ScanQueryLeft = 60   # 스캔 1회당 최대 조회 수 (속도 제한 방지)
+    # 내 오버레이 박스가 가린 영역만 제외 (F8 시점에 부모가 기록한 실시간 좌표, 5분 내 것만 신뢰)
+    $script:MyBoxRect = $null
+    $script:SawMyNick = $false
+    try {
+        $rf = Join-Path $PSScriptRoot 'scan-box.json'
+        if ((Test-Path $rf) -and ((Get-Date) - (Get-Item $rf).LastWriteTime).TotalMinutes -lt 5) {
+            $bx = Get-Content $rf -Raw | ConvertFrom-Json
+            if ([double]$bx.W -gt 0 -and [double]$bx.H -gt 0) {
+                $script:MyBoxRect = @{
+                    X1 = [double]$bx.X - 8; Y1 = [double]$bx.Y - 8
+                    X2 = [double]$bx.X + [double]$bx.W + 8
+                    Y2 = [double]$bx.Y + [double]$bx.H + 8
+                }
+            }
+        }
+    } catch {}
     $found = @{}
-    for ($try = 0; $try -lt 3 -and $found.Count -lt 3; $try++) {
-        if ($try -gt 0) { Start-Sleep -Milliseconds 400 }
+    for ($try = 0; $try -lt 3; $try++) {
+        # 목표 인원: 화면에 내 닉이 보이면(=내 대국) 3명, 아니면(관전 등) 4명
+        $target = 4
+        if ($script:SawMyNick) { $target = 3 }
+        if ($found.Count -ge $target) { break }
+        if ($try -gt 0) { Start-Sleep -Milliseconds 700 }
         $null = $script:ScanLog.Add("===== 시도 $($try + 1) ($(Get-Date -Format 'HH:mm:ss'))")
         $bmp = $null
         try { $bmp = Get-ScreenCapture } catch { continue }
         try {
-            # 명패 정밀 스캔을 먼저: 명패 위치가 항상 정답이므로 잡음 조각이 자리를 선점하지 못하게 함
-            $null = $script:ScanLog.Add('--- 정밀(명패) 스캔')
-            Resolve-Tokens (Get-PlateTokens $bmp) $found
-            if ($found.Count -lt 3) {
-                $null = $script:ScanLog.Add('--- 전체 스캔')
-                Resolve-Tokens (Get-FullTokens $bmp) $found
+            $fullT = Get-FullTokens $bmp
+            $isRankScreen = (@($fullT | Where-Object { ($_.Text -replace '\s', '') -match '^[1-4](위|位)' }).Count -gt 0)
+            if ($isRankScreen) {
+                # 순위 화면(패보/결과 목록): 명패 밴드 무의미 - 순위 목록만 처리
+                $null = $script:ScanLog.Add('--- 순위 화면 스캔')
+                Resolve-Tokens $fullT $found $true
+            } else {
+                # 명패 정밀 스캔을 먼저: 명패 위치가 항상 정답이므로 잡음 조각이 자리를 선점하지 못하게 함
+                $null = $script:ScanLog.Add('--- 정밀(명패) 스캔')
+                Resolve-Tokens (Get-PlateTokens $bmp $try) $found
+                $target = 4
+                if ($script:SawMyNick) { $target = 3 }
+                if ($found.Count -lt $target) {
+                    # 2번째 시도부터는 중앙 제외 해제 (대국 소개/점수 결과 화면은 이름이 중앙에 나옴)
+                    $noCenter = ($try -ge 1)
+                    $null = $script:ScanLog.Add("--- 전체 스캔 (중앙 포함: $noCenter)")
+                    Resolve-Tokens $fullT $found $noCenter
+                }
             }
         } catch {
             $null = $script:ScanLog.Add("오류: $($_.Exception.Message)")
@@ -1112,6 +1339,31 @@ function Scan-Opponents {
 }
 
 # ---------------- 테스트 모드 ----------------
+
+# 내부 테스트: 토큰 시나리오(JSON)를 실제 매칭 파이프라인에 통과시켜 결과 출력
+if ($args.Count -ge 2 -and $args[0] -eq '-TestResolve') {
+    $sc = Get-Content ([string]$args[1]) -Raw -Encoding UTF8 | ConvertFrom-Json
+    $script:Nickname = [string]$sc.MyNick
+    $script:SawMyNick = $false
+    $script:ScanQueryLeft = 45
+    $script:MyBoxRect = $null
+    $script:ScanLog = New-Object Collections.ArrayList
+    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $tokens = New-Object Collections.ArrayList
+    foreach ($t in $sc.Tokens) {
+        $null = $tokens.Add(@{ Text = [string]$t.T; X = [double]$t.X * $b.Width; Y = [double]$t.Y * $b.Height; Src = [string]$t.S })
+    }
+    $found = @{}
+    Resolve-Tokens $tokens $found ([bool]$sc.NoCenter)
+    $target = 4
+    if ($script:SawMyNick) { $target = 3 }
+    [pscustomobject]@{
+        SawMyNick = $script:SawMyNick
+        Target = $target
+        Found = @($found.Values | ForEach-Object { $_.Nick })
+    } | ConvertTo-Json -Compress
+    exit 0
+}
 
 if ($args -contains '-TestData') {
     try {
@@ -3594,6 +3846,16 @@ function Update-Opponents {
     Show-ScanIndicator
     $resFile = Join-Path $PSScriptRoot 'scan-result.json'
     try { Remove-Item $resFile -Force -ErrorAction SilentlyContinue } catch {}
+    # 스캔 프로세스가 내 박스가 가린 부분만 건너뛰도록 실시간 좌표 전달
+    try {
+        $w0 = $script:MyBox.Win
+        @{
+            X = [double]$w0.Left * $script:DpiScale
+            Y = [double]$w0.Top * $script:DpiScale
+            W = [math]::Max(220, [double]$w0.ActualWidth) * $script:DpiScale
+            H = [math]::Max(80, [double]$w0.ActualHeight) * $script:DpiScale
+        } | ConvertTo-Json | Out-File (Join-Path $PSScriptRoot 'scan-box.json') -Encoding utf8
+    } catch {}
     $script:ScanStartTime = Get-Date
     $script:ScanProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-ScanOnce'
     $script:ScanPollTimer.Start()
