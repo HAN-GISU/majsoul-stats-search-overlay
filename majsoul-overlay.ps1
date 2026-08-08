@@ -41,6 +41,8 @@ $script:ExtCache = $null  # 통산 통계 캐시
 $script:ExtCacheTime = [DateTime]::MinValue
 $script:BasisCache = @{}  # id -> 최근 N국 기준 시작 시각 캐시
 $script:SyncingUI = $false
+$script:NetBusy = $false        # 갱신(네트워크) 진행 중 재진입 방지
+$script:GameToastFired = $false # 이번 갱신에서 대국 반영 토스트가 떴는지
 $script:Settings = @{
     Stable = $true; Danger = $true; RankColors = $false; Streak = $true; Spark = $true; Toast = $true
     ShowRank = $true; ShowGoal = $true; ShowGame = $true; ShowStat1 = $true; ShowStat2 = $true; ShowStat3 = $true; ShowStat4 = $true
@@ -56,14 +58,52 @@ $script:OppWindows = @{}  # id -> WPF 창
 
 # ---------------- amae-koromo API ----------------
 
+# UI 스레드가 네트워크 응답을 기다리는 동안에도 메시지 펌프를 돌려 오버레이가 멈추지 않게 하는 헬퍼.
+# GUI 프로세스에서만 $script:UiPump가 켜지고, 자식 프로세스(-ScanOnce/-ReportOnce/-DetailOnce)는 기존 동기 방식 그대로.
+function Invoke-UiPump {
+    param([int]$Ms = 0)
+    $end = [DateTime]::UtcNow.AddMilliseconds($Ms)
+    do {
+        $frame = New-Object Windows.Threading.DispatcherFrame
+        $null = [Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+            [Windows.Threading.DispatcherPriority]::Background,
+            [action] { $frame.Continue = $false }.GetNewClosure())
+        [Windows.Threading.Dispatcher]::PushFrame($frame)
+        if ([DateTime]::UtcNow -lt $end) { Start-Sleep -Milliseconds 15 }
+    } while ([DateTime]::UtcNow -lt $end)
+}
+
+function Wait-Api {
+    param([int]$Ms)
+    if ($script:UiPump) { Invoke-UiPump $Ms } else { Start-Sleep -Milliseconds $Ms }
+}
+
+function Invoke-Api {
+    param([string]$Uri, [int]$TimeoutSec = 15)
+    if (-not $script:UiPump) { return Invoke-RestMethod -Uri $Uri -TimeoutSec $TimeoutSec }
+    $task = $script:Http.GetStringAsync($Uri)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while (-not $task.IsCompleted) {
+        if ([DateTime]::UtcNow -gt $deadline) { throw "API 시간 초과: $Uri" }
+        Invoke-UiPump 30
+    }
+    if ($task.IsFaulted -or $task.IsCanceled) {
+        $ex = $null
+        if ($task.Exception) { $ex = $task.Exception.InnerException }
+        if (-not $ex) { $ex = New-Object Exception "API 요청 실패: $Uri" }
+        throw $ex
+    }
+    return ($task.Result | ConvertFrom-Json)
+}
+
 function Get-RangeStats {
     param($Id, $StartMs, $EndMs)
     foreach ($try in 1..3) {
         try {
-            return Invoke-RestMethod -Uri "$Api/player_stats/$Id/$StartMs/$EndMs`?mode=$($script:Modes)" -TimeoutSec 15
+            return Invoke-Api "$Api/player_stats/$Id/$StartMs/$EndMs`?mode=$($script:Modes)" 15
         } catch {
             # 속도 제한(429/530) 대비 점진적 대기
-            Start-Sleep -Milliseconds (500 * $try)
+            Wait-Api (500 * $try)
         }
     }
     return $null
@@ -72,7 +112,7 @@ function Get-RangeStats {
 function Get-PlayerId {
     if ($script:PlayerId) { return $script:PlayerId }
     if ($script:CachedId) { return $script:CachedId }
-    $found = Invoke-RestMethod -Uri "$Api/search_player/$([uri]::EscapeDataString($script:Nickname))?limit=20" -TimeoutSec 15
+    $found = Invoke-Api "$Api/search_player/$([uri]::EscapeDataString($script:Nickname))?limit=20" 15
     $exact = @($found | Where-Object { $_.nickname -eq $script:Nickname })
     if ($exact.Count -eq 0) { $exact = @($found) }
     if ($exact.Count -eq 0) { throw "플레이어를 찾을 수 없습니다: $($script:Nickname)" }
@@ -100,7 +140,7 @@ function Get-RankSequence {
         }
         return $out
     }
-    Start-Sleep -Milliseconds 150
+    Wait-Api 150
     $mid = [long](($FromMs + $ToMs) / 2)
     return @(Get-RankSequence $Id $FromMs $mid ($Depth + 1)) + @(Get-RankSequence $Id $mid $ToMs ($Depth + 1))
 }
@@ -591,7 +631,7 @@ function Get-OverlayData {
     }
     # 통산 통계(화료율 등)는 잘 안 변하므로 10분에 한 번만 조회
     if ($null -eq $script:ExtCache -or ([DateTime]::Now - $script:ExtCacheTime).TotalSeconds -gt 600) {
-        $script:ExtCache = Invoke-RestMethod -Uri "$Api/player_extended_stats/$id/$statStart/$nowPlus`?mode=$($script:Modes)" -TimeoutSec 15
+        $script:ExtCache = Invoke-Api "$Api/player_extended_stats/$id/$statStart/$nowPlus`?mode=$($script:Modes)" 15
         $script:ExtCacheTime = [DateTime]::Now
     }
     $ext = $script:ExtCache
@@ -743,7 +783,7 @@ function Get-OpponentData {
         if ($f) { $fullStats = $f }
     }
     $ext = $null
-    try { $ext = Invoke-RestMethod -Uri "$Api/player_extended_stats/$Id/$statStart/$nowPlus`?mode=$($script:Modes)" -TimeoutSec 15 } catch {}
+    try { $ext = Invoke-Api "$Api/player_extended_stats/$Id/$statStart/$nowPlus`?mode=$($script:Modes)" 15 } catch {}
     $effOpp = Get-EffectiveLevel $fullStats.level
     $rank = Get-RankLine -LvlId ([int]$effOpp.Id) -Cur ([int]$effOpp.Pt) -BasePt $null
     $statParts = Get-StatParts $stats $ext
@@ -1534,6 +1574,14 @@ if ($diIdx -ge 0) {
 $script:InstanceMutex = New-Object Threading.Mutex($false, 'MajsoulOverlayMutex')
 if (-not $script:InstanceMutex.WaitOne(0)) { exit }
 
+# 갱신 중 UI 멈춤 방지: 비동기 HTTP + 메시지 펌프 활성화 (GUI 프로세스 전용)
+try {
+    Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+    $script:Http = New-Object System.Net.Http.HttpClient
+    $script:Http.Timeout = [TimeSpan]::FromSeconds(30)
+    $script:UiPump = $true
+} catch { $script:UiPump = $false }
+
 # 스팀 래퍼가 넘겨주는 게임 프로세스 이름 (-GameProc <이름>): 게임 종료 시 오버레이도 종료
 $GameProcName = $null
 $gpIdx = [Array]::IndexOf($args, '-GameProc')
@@ -1939,12 +1987,15 @@ function New-StatWindow {
     # ⟳ 클릭: 즉시 새로고침 (진행 중엔 ⏳ 표시, 완료 시 토스트)
     $box.BtnRefresh.Add_MouseLeftButtonDown({
         $args[1].Handled = $true
+        if ($script:NetBusy) { return }   # 이미 갱신 중이면 무시
         $s = $args[0]
         $s.Text = '⏳'
         try { $s.Dispatcher.Invoke([action] {}, [Windows.Threading.DispatcherPriority]::Render) } catch {}
+        $script:GameToastFired = $false
         try { Refresh-All } catch {}
         $s.Text = '⟳'
-        Show-Toast '갱신되었습니다 ✓' $true
+        # 새 대국이 반영됐으면 대국 토스트가 이미 떴으므로 일반 갱신 토스트는 생략
+        if (-not $script:GameToastFired) { Show-Toast '갱신되었습니다 ✓' $true }
     })
     # 📋 클릭: 오늘의 리포트 카드
     $box.BtnReport.Add_MouseLeftButtonDown({
@@ -2251,13 +2302,17 @@ function Apply-Nickname {
 
 # ⟳ 즉시 새로고침: 내 전적 + 떠 있는 상대 박스 전부 재조회
 function Refresh-All {
+    if ($script:NetBusy) { return }
     $script:ExtCache = $null
     Update-Overlay
-    foreach ($k in @($script:OppWindows.Keys)) {
-        $script:OppCache.Remove([string]$k)
-        $d = Get-OpponentData $k
-        if ($d) { Set-StatWindow $script:OppWindows[$k] $d }
-    }
+    $script:NetBusy = $true
+    try {
+        foreach ($k in @($script:OppWindows.Keys)) {
+            $script:OppCache.Remove([string]$k)
+            $d = Get-OpponentData $k
+            if ($d) { Set-StatWindow $script:OppWindows[$k] $d }
+        }
+    } finally { $script:NetBusy = $false }
 }
 
 # 박스/리포트 크기 배율 적용 (0.6~2.0)
@@ -3061,39 +3116,96 @@ function Update-Spark {
     $cv.Visibility = 'Visible'
 }
 
-# 새 대국 반영 토스트
+# 새 대국 반영 토스트 (Fx: 'up' 글리터 상승 / 'down' 하락 화살표, Magnitude: pt 증감 크기 → 파티클 수)
 function Show-Toast {
-    param([string]$Text, [bool]$Positive)
+    param([string]$Text, [bool]$Positive, [string]$Fx = '', [int]$Magnitude = 0)
     try {
         $x = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" SizeToContent="WidthAndHeight" ResizeMode="NoResize">
-  <Border CornerRadius="10" Background="#D8202433" Padding="16,9">
-    <TextBlock x:Name="T" FontFamily="Malgun Gothic" FontSize="17" FontWeight="ExtraBold"/>
-  </Border>
+  <Grid>
+    <Border x:Name="B" CornerRadius="10" Background="#D8202433" Padding="16,9" Margin="22,30,22,30">
+      <TextBlock x:Name="T" FontFamily="Malgun Gothic" FontSize="17" FontWeight="ExtraBold"/>
+    </Border>
+    <Canvas x:Name="P" IsHitTestVisible="False"/>
+  </Grid>
 </Window>
 '@
         $tw = [Windows.Markup.XamlReader]::Parse($x)
-        $tb = $tw.FindName('T')
+        $tb = $tw.FindName('T'); $bd = $tw.FindName('B'); $cv = $tw.FindName('P')
         $tb.Text = $Text
         if ($Positive) { $tb.Foreground = New-Brush '#FF7BE38B' } else { $tb.Foreground = New-Brush '#FFFF7B7B' }
-        $tw.Left = $script:MyBox.Win.Left
-        $tw.Top = $script:MyBox.Win.Top - 52
-        if ($tw.Top -lt 0) { $tw.Top = $script:MyBox.Win.Top + 150 }
+        # 파티클 여백(22,30)만큼 창을 넓혔으므로 Border가 기존 위치에 오도록 보정
+        $tw.Left = $script:MyBox.Win.Left - 22
+        $tw.Top = $script:MyBox.Win.Top - 52 - 30
+        if ($tw.Top -lt 0) { $tw.Top = $script:MyBox.Win.Top + 150 - 30 }
         $tw.Opacity = 0
         $tw.Show()
-        # 페이드 인
-        $fade = New-Object Windows.Media.Animation.DoubleAnimation
-        $fade.From = 0; $fade.To = 1
-        $fade.Duration = [Windows.Duration]::new([TimeSpan]::FromMilliseconds(250))
+        # 페이드 인 → 유지 → 페이드 아웃
+        $mkKf = { param($v, $ms) New-Object Windows.Media.Animation.LinearDoubleKeyFrame([double]$v, [Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromMilliseconds($ms))) }
+        $fade = New-Object Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+        foreach ($k in @(@(0,0), @(1,250), @(1,3450), @(0,3900))) { [void]$fade.KeyFrames.Add((& $mkKf $k[0] $k[1])) }
         $tw.BeginAnimation([Windows.UIElement]::OpacityProperty, $fade)
+        if ($Fx -eq 'up' -or $Fx -eq 'down') {
+            $up = ($Fx -eq 'up')
+            # 증감 색 글로우
+            $glow = New-Object Windows.Media.Effects.DropShadowEffect
+            $glow.ShadowDepth = 0; $glow.BlurRadius = 16; $glow.Opacity = 0.7
+            $glow.Color = [Windows.Media.ColorConverter]::ConvertFromString($(if ($up) { '#FF7BE38B' } else { '#FFFF6B6B' }))
+            $bd.Effect = $glow
+            # 상승은 아래→위, 하락은 위→아래로 살짝 미끄러지며 등장
+            $tt = New-Object Windows.Media.TranslateTransform
+            $bd.RenderTransform = $tt
+            $sl = New-Object Windows.Media.Animation.DoubleAnimation
+            $sl.From = $(if ($up) { 14 } else { -14 }); $sl.To = 0
+            $sl.Duration = [Windows.Duration]::new([TimeSpan]::FromMilliseconds(400))
+            $eo = New-Object Windows.Media.Animation.CubicEase; $eo.EasingMode = 'EaseOut'
+            $sl.EasingFunction = $eo
+            $tt.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $sl)
+            # 파티클: 상승=피어오르는 글리터, 하락=떨어지는 화살표. 증감 폭이 클수록 개수 증가
+            $tw.UpdateLayout()
+            $W = [Math]::Max($tw.ActualWidth, 120); $H = [Math]::Max($tw.ActualHeight, 90)
+            $rnd = New-Object System.Random
+            if ($up) { $chars = '✦','✧','★','☆'; $cols = '#FFFFE082','#FF7BE38B','#FFFFF6C8','#FFB9F6CA' }
+            else     { $chars = '▼','▾';          $cols = '#FFFF7B7B','#FFFF9E9E','#FFD95F5F' }
+            $n = 14 + [Math]::Min(10, [int]([Math]::Abs($Magnitude) / 8))
+            for ($i = 0; $i -lt $n; $i++) {
+                $p = New-Object Windows.Controls.TextBlock
+                $p.Text = [string]$chars[$rnd.Next($chars.Count)]
+                $p.FontSize = 9 + $rnd.Next(8)
+                $p.Foreground = New-Brush ([string]$cols[$rnd.Next($cols.Count)])
+                $p.Opacity = 0
+                $x0 = 4 + $rnd.NextDouble() * ($W - 18)
+                if ($up) { $y0 = $H - 34 - $rnd.Next(14); $dy = -(34 + $rnd.Next(30)) }
+                else     { $y0 = 24 + $rnd.Next(14);      $dy = 30 + $rnd.Next(28) }
+                [Windows.Controls.Canvas]::SetLeft($p, $x0)
+                [Windows.Controls.Canvas]::SetTop($p, $y0)
+                [void]$cv.Children.Add($p)
+                $bt = [TimeSpan]::FromMilliseconds($rnd.Next(1400))
+                $durMs = 800 + $rnd.Next(700)
+                $ay = New-Object Windows.Media.Animation.DoubleAnimation
+                $ay.From = $y0; $ay.To = $y0 + $dy
+                $ay.BeginTime = $bt; $ay.Duration = [Windows.Duration]::new([TimeSpan]::FromMilliseconds($durMs))
+                $ez = New-Object Windows.Media.Animation.CubicEase; $ez.EasingMode = $(if ($up) { 'EaseOut' } else { 'EaseIn' })
+                $ay.EasingFunction = $ez
+                $p.BeginAnimation([Windows.Controls.Canvas]::TopProperty, $ay)
+                $ax = New-Object Windows.Media.Animation.DoubleAnimation
+                $ax.From = $x0; $ax.To = $x0 + ($rnd.NextDouble() * 20 - 10)
+                $ax.BeginTime = $bt; $ax.Duration = $ay.Duration
+                $p.BeginAnimation([Windows.Controls.Canvas]::LeftProperty, $ax)
+                $ao = New-Object Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+                $ao.BeginTime = $bt
+                foreach ($k in @(@(0,0), @(1,[int]($durMs*0.2)), @(0.9,[int]($durMs*0.6)), @(0,$durMs))) { [void]$ao.KeyFrames.Add((& $mkKf $k[0] $k[1])) }
+                $p.BeginAnimation([Windows.UIElement]::OpacityProperty, $ao)
+            }
+        }
         $t = New-Object Windows.Threading.DispatcherTimer
         $t.Interval = [TimeSpan]::FromSeconds(4)
         $t.Add_Tick({ $args[0].Stop(); $tw.Close() }.GetNewClosure())
         $t.Start()
-    } catch {}
+    } catch { if ($env:MJS_TOAST_DEBUG) { Write-Host "Toast error: $_" } }
 }
 
 # ---- 리포트 카드 (일/주/월/연 탭 + 비동기 로딩) ----
@@ -4161,6 +4273,8 @@ if (-not $script:Nickname -or $script:Nickname -eq '여기에닉네임') {
 }
 
 function Update-Overlay {
+    if ($script:NetBusy) { return }   # 갱신 중 타이머/버튼 재진입 방지
+    $script:NetBusy = $true
     try {
         $d = Get-OverlayData
         $script:LastData = $d
@@ -4170,12 +4284,15 @@ function Update-Overlay {
             $lastRank = $script:TodaySeq[$script:TodaySeq.Count - 1]
             $txt = '{0}위' -f $lastRank
             $pos = ($lastRank -le 2)
+            $mag = 0
             if ($null -ne $script:LastShownPt -and $null -ne $d.CurPt) {
                 $delta = $d.CurPt - $script:LastShownPt
                 if ($delta -ge 0) { $txt += "  ▲$delta" } else { $txt += "  ▼$(-$delta)" }
                 $pos = ($delta -ge 0)
+                $mag = [Math]::Abs($delta)
             }
-            Show-Toast $txt $pos
+            Show-Toast $txt $pos $(if ($pos) { 'up' } else { 'down' }) $mag
+            $script:GameToastFired = $true
         }
         if ($script:TodayCount -ge 0) { $script:AnnouncedCount = $script:TodayCount }
         if ($null -ne $d.CurPt) { $script:LastShownPt = $d.CurPt }
@@ -4183,7 +4300,8 @@ function Update-Overlay {
         $dg = [int]$script:Settings.DailyGoal
         if ($dg -gt 0 -and $d.Diff -ge $dg -and $script:GoalCelebrated -ne [DateTime]::Today) {
             $script:GoalCelebrated = [DateTime]::Today
-            Show-Toast "오늘 목표 +$dg pt 달성! 🎉" $true
+            Show-Toast "오늘 목표 +$dg pt 달성! 🎉" $true 'up' 60
+            $script:GameToastFired = $true
         }
     } catch {
         $my.TbName.Text = '전적 오버레이'
@@ -4193,7 +4311,7 @@ function Update-Overlay {
         $my.TbStat2.Text = ''
         $my.TbStat3.Text = ''
         $my.TbStat4.Text = ''
-    }
+    } finally { $script:NetBusy = $false }
 }
 
 # --- 상대 박스 ---
