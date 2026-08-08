@@ -3,6 +3,7 @@ overlay-pos.json
 scan-log.txt
 scan-result.json
 report-result.json
+detail-result.json
 report-*.png
 *.zip
 install-ocr-zh.ps1
