@@ -1031,6 +1031,11 @@ function Get-TokenVariants {
                     if ($v -and $v.Length -ge 2 -and $variants -notcontains $v) { $null = $variants.Add($v) }
                 }
             }
+            # 장음 기호 ー ↔ 한자 一 혼동 (喝水我要喝ー桶 → 喝水我要喝一桶)
+            if ($base.Contains([string][char]0x30FC)) {
+                $v = $base.Replace([string][char]0x30FC, [string][char]0x4E00)
+                if ($variants -notcontains $v) { $null = $variants.Add($v) }
+            }
             # 물결표 정규화: OCR의 ASCII ~ → 닉네임의 전각 물결 (貞~照 → 貞〜照)
             if ($base.Contains('~')) {
                 foreach ($v in @($base.Replace('~', [string][char]0x301C), $base.Replace('~', [string][char]0xFF5E))) {
@@ -1087,7 +1092,7 @@ function Find-ByPrefix {
         if ($script:ScanQueryLeft -le 0) { return $false }
         $script:ScanQueryLeft--
         try {
-            Start-Sleep -Milliseconds 150
+            Start-Sleep -Milliseconds 100
             $script:NickCache[$ck] = @(Invoke-RestMethod -Uri "$Api/search_player/$([uri]::EscapeDataString($pre))?limit=100" -TimeoutSec 10)
         } catch { return $false }
     }
@@ -1175,6 +1180,7 @@ function Resolve-Tokens {
         $ordered = @($cands | Sort-Object @{ Expression = { if ($_.Src -eq 'p') { 0 } else { 1 } } }, @{ Expression = { -($_.Raw.Length) } })
     }
 
+    foreach ($phase in 0, 1) {
     foreach ($tk in $ordered) {
         $raw = [string]$tk.Raw
         try {
@@ -1193,7 +1199,18 @@ function Resolve-Tokens {
 
         # 가나가 포함된 토큰은 출처와 무관하게 정밀 보정 (이름일 가능성이 높음)
         $deep = (($tk.Src -eq 'p') -or ($raw -match '[ぁ-ゖァ-ヺ]'))
-        foreach ($t in (Get-TokenVariants $raw $deep)) {
+        $vlist = $null
+        if ($phase -eq 0) {
+            # 1단계: 원문과 구두점 제거본만 (완전한 닉의 정확 일치가 잡음 변형보다 먼저 예산을 쓰도록)
+            $vlist = New-Object Collections.ArrayList
+            $null = $vlist.Add($raw)
+            $tr = $raw.Trim([char[]]@('.', ',', [char]0xB7, "'", '|', '~', '-', '_', '(', ')', '[', ']', '<', '>', '!', ':', ';', '"',
+                                      [char]0x3001, [char]0x3002, [char]0xFF0C, [char]0xFF61, [char]0xFF64, [char]0x30FB))
+            if ($tr -and $tr -ne $raw -and $vlist -notcontains $tr) { $null = $vlist.Add($tr) }
+        } else {
+            $vlist = Get-TokenVariants $raw $deep
+        }
+        foreach ($t in $vlist) {
             # 최소 길이: 한자/가나 2글자, 명패 라틴 3글자, 그 외 4글자
             $minLen = 4
             if ($t -match '[぀-ヿ一-鿿]') { $minLen = 2 }
@@ -1210,7 +1227,7 @@ function Resolve-Tokens {
                 if ($script:ScanQueryLeft -le 0) { continue }
                 $script:ScanQueryLeft--
                 try {
-                    Start-Sleep -Milliseconds 150
+                    Start-Sleep -Milliseconds 100
                     $res = Invoke-RestMethod -Uri "$Api/search_player/$([uri]::EscapeDataString($t))?limit=5" -TimeoutSec 10
                     $id = $false
                     # 후보 순서: 대소문자 정확 일치 → 대소문자 무시 일치(최근 활동 순)
@@ -1256,8 +1273,8 @@ function Resolve-Tokens {
             }
         }
 
-        # 변형으로도 못 찾았고 명패에서 읽힌 CJK 토큰이면 접두사 유사매칭 시도
-        if ($tk.Src -eq 'p' -and $raw -match '^[぀-ヿ一-鿿]{2}') {
+        # 변형으로도 못 찾았고 명패에서 읽힌 CJK 토큰이면 접두사 유사매칭 시도 (2단계에서만)
+        if ($phase -eq 1 -and $tk.Src -eq 'p' -and $raw -match '^[぀-ヿ一-鿿]{2}') {
             $already = $false
             foreach ($kv in @($FoundMap.GetEnumerator())) {
                 if ([math]::Abs([double]$kv.Value.X - [double]$tk.X) -lt 240 -and [math]::Abs([double]$kv.Value.Y - [double]$tk.Y) -lt 60) { $already = $true; break }
@@ -1275,6 +1292,7 @@ function Resolve-Tokens {
         } catch {
             $null = $script:ScanLog.Add("!! 토큰 처리 오류: $raw - $($_.Exception.Message)")
         }
+    }
     }
 }
 
@@ -1305,7 +1323,7 @@ function Scan-Opponents {
         $target = 4
         if ($script:SawMyNick) { $target = 3 }
         if ($found.Count -ge $target) { break }
-        if ($try -gt 0) { Start-Sleep -Milliseconds 700 }
+        if ($try -gt 0) { Start-Sleep -Milliseconds 500 }
         $null = $script:ScanLog.Add("===== 시도 $($try + 1) ($(Get-Date -Format 'HH:mm:ss'))")
         $bmp = $null
         try { $bmp = Get-ScreenCapture } catch { continue }
@@ -1396,11 +1414,16 @@ if ($args -contains '-ScanOnce') {
     } catch {}
     $opps = Scan-Opponents
     $out = @()
+    $resPath = Join-Path $PSScriptRoot 'scan-result.json'
     foreach ($o in $opps) {
         $d = Get-OpponentData $o.Id
-        if ($d) { $out += [pscustomobject]@{ Id = "$($o.Id)"; X = [double]$o.X; Y = [double]$o.Y; Data = $d } }
+        if ($d) {
+            $out += [pscustomobject]@{ Id = "$($o.Id)"; X = [double]$o.X; Y = [double]$o.Y; Data = $d }
+            # 부분 결과 즉시 저장 - 시간 초과로 종료돼도 여기까지의 상대는 표시됨
+            ConvertTo-Json -InputObject $out -Depth 6 | Out-File $resPath -Encoding utf8
+        }
     }
-    ConvertTo-Json -InputObject $out -Depth 6 | Out-File (Join-Path $PSScriptRoot 'scan-result.json') -Encoding utf8
+    ConvertTo-Json -InputObject $out -Depth 6 | Out-File $resPath -Encoding utf8
     exit 0
 }
 $riIdx = [Array]::IndexOf($args, '-ReportOnce')
@@ -3901,16 +3924,26 @@ function Show-ScanIndicator {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-        Topmost="True" ShowInTaskbar="False" SizeToContent="WidthAndHeight" ResizeMode="NoResize">
+        Topmost="True" ShowInTaskbar="False" SizeToContent="WidthAndHeight" ResizeMode="NoResize" Cursor="Hand">
   <Border CornerRadius="10" Background="#D8202433" Padding="16,9">
-    <TextBlock Text="🔍 상대 스캔 중..." FontFamily="Malgun Gothic" FontSize="16" FontWeight="ExtraBold" Foreground="#FFF2F4F8"/>
+    <StackPanel>
+      <TextBlock x:Name="TbScanMain" Text="🔍 상대 스캔 중... 0초" FontFamily="Malgun Gothic" FontSize="16" FontWeight="ExtraBold" Foreground="#FFF2F4F8"/>
+      <TextBlock x:Name="TbScanSub" Text="" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FFAAB4C4" Margin="1,3,0,0"/>
+    </StackPanel>
   </Border>
 </Window>
 '@
         $iw = [Windows.Markup.XamlReader]::Parse($x)
+        $est = [int]$script:LastScanSecs
+        if ($est -le 0) { $est = 50 }
+        $iw.FindName('TbScanSub').Text = "예상 약 $est`초 · 클릭하면 여기까지 결과로 중지"
         $iw.Left = $script:MyBox.Win.Left
-        $iw.Top = $script:MyBox.Win.Top - 52
+        $iw.Top = $script:MyBox.Win.Top - 64
         if ($iw.Top -lt 0) { $iw.Top = $script:MyBox.Win.Top + 150 }
+        # 클릭 = 수동 중지: 자식 프로세스를 종료하면 폴 타이머가 부분 결과를 표시함
+        $iw.Add_MouseLeftButtonDown({
+            try { if ($script:ScanProc -and -not $script:ScanProc.HasExited) { $script:ScanProc.Kill() } } catch {}
+        })
         $iw.Show()
         $an = New-Object Windows.Media.Animation.DoubleAnimation
         $an.From = 0.35; $an.To = 1
@@ -3959,6 +3992,7 @@ if ($AutoScanMinutes -gt 0) {
 $script:ScanProc = $null
 $script:ScanStartTime = $null
 $script:ScanIndicator = $null
+$script:LastScanSecs = 50
 $scanPollTimer = New-Object Windows.Threading.DispatcherTimer
 $scanPollTimer.Interval = [TimeSpan]::FromMilliseconds(400)
 $scanPollTimer.Add_Tick({
@@ -3968,14 +4002,21 @@ $scanPollTimer.Add_Tick({
         return
     }
     if (-not $script:ScanProc.HasExited) {
-        # 45초 넘게 걸리면 강제 종료
-        if ($script:ScanStartTime -and ((Get-Date) - $script:ScanStartTime).TotalSeconds -gt 45) {
-            try { $script:ScanProc.Kill() } catch {}
+        # 경과 시간 표시 갱신 (중지는 사용자가 인디케이터 클릭으로)
+        if ($script:ScanStartTime -and $script:ScanIndicator) {
+            $sec = [int]((Get-Date) - $script:ScanStartTime).TotalSeconds
+            try { $script:ScanIndicator.FindName('TbScanMain').Text = "🔍 상대 스캔 중... $sec`초" } catch {}
+            # 비정상 상황 안전망 (999초)
+            if ($sec -gt 999) { try { $script:ScanProc.Kill() } catch {} }
         }
         return
     }
     $script:ScanProc = $null
     $script:ScanPollTimer.Stop()
+    if ($script:ScanStartTime) {
+        $took = [int]((Get-Date) - $script:ScanStartTime).TotalSeconds
+        if ($took -ge 5 -and $took -le 300) { $script:LastScanSecs = $took }
+    }
     Hide-ScanIndicator
     $resFile = Join-Path $PSScriptRoot 'scan-result.json'
     $entries = @()
