@@ -383,7 +383,7 @@ function Get-PtAt {
     return Get-EffectiveLevel $st.level
 }
 
-# 리포트 팩 생성 (일/주/월/년) - 백그라운드 프로세스에서 호출됨
+# 리포트 팩 생성 (일/주/월/년/전체) - 백그라운드 프로세스에서 호출됨
 function Build-ReportPack {
     param([string]$Mode, [DateTime]$Anchor)
     $id = Get-PlayerId
@@ -447,6 +447,12 @@ function Build-ReportPack {
         $bounds = @(); for ($i = 0; $i -le $dim; $i++) { $bounds += $s.AddDays($i) }
         $labels = @(1..$dim | ForEach-Object { [string]$_ })
         $title = ('{0}년 {1}월' -f $s.Year, $s.Month)
+    } elseif ($Mode -eq 'all') {
+        # 전체 기간 = 연도별 버킷 (amae-koromo 데이터가 존재하는 2018년부터, 빈 앞구간은 아래서 잘라냄)
+        $s = New-Object DateTime 2018, 1, 1
+        $bounds = @(); for ($y = 2018; $y -le ($today.Year + 1); $y++) { $bounds += (New-Object DateTime $y, 1, 1) }
+        $labels = @(2018..$today.Year | ForEach-Object { [string]$_ })
+        $title = '전체'
     } else {
         $s = New-Object DateTime $Anchor.Year, 1, 1
         $bounds = @(); for ($i = 0; $i -le 12; $i++) { $bounds += $s.AddMonths($i) }
@@ -456,6 +462,8 @@ function Build-ReportPack {
     $buckets = @()
     $rcTotal = @(0, 0, 0, 0); $nTotal = 0; $diffTotal = 0
     $prevEff = Get-PtAt $id ([DateTimeOffset]::new($bounds[0]).ToUnixTimeMilliseconds())
+    # 전체 기간: 계정 시작 전 시점이라 유효 단위가 없으면 초심1 0pt에서 출발한 것으로 간주
+    if ($Mode -eq 'all' -and (-not $prevEff -or [int]$prevEff.Id -le 0)) { $prevEff = @{ Id = 101; Pt = 0 } }
     $startLvl = 0; $startPt = $null
     if ($prevEff) { $startLvl = [int]$prevEff.Id; $startPt = [int]$prevEff.Pt }
     $curLvlId = $startLvl; $endPt = $startPt
@@ -480,6 +488,10 @@ function Build-ReportPack {
         $nTotal += $bn; $diffTotal += $bd
         $buckets += @{ Label = $labels[$i]; N = $bn; Diff = $bd; Lvl = $curLvlId; Pt = $endPt }
         Start-Sleep -Milliseconds 60
+    }
+    # 전체 기간: 첫 대국 이전의 빈 연도는 차트에서 제외
+    if ($Mode -eq 'all') {
+        while ($buckets.Count -gt 1 -and [int]$buckets[0].N -eq 0) { $buckets = @($buckets | Select-Object -Skip 1) }
     }
     return @{ Mode = $Mode; Anchor = $s.ToString('yyyy-MM-dd'); Title = $title; N = $nTotal; Diff = $diffTotal; RankCounts = $rcTotal; Seq = @(); Pts = @(); Buckets = $buckets; StartLvl = $startLvl; StartPt = $startPt; EndLvl = $curLvlId; EndPt = $endPt }
 }
@@ -1148,6 +1160,12 @@ function Test-NickPlausible {
     return $true
 }
 
+# 새 상대가 확정되는 즉시 부모에 알림 (1명씩 부분 표시) - 스캔 프로세스의 Scan-Opponents만 설정
+function Notify-NewFound {
+    param($FoundMap)
+    if ($script:ScanOnProgress) { try { & $script:ScanOnProgress @($FoundMap.Values) } catch {} }
+}
+
 function Resolve-Tokens {
     param($Tokens, $FoundMap, [bool]$NoCenter = $false)
     $myNick = $script:Nickname
@@ -1162,8 +1180,11 @@ function Resolve-Tokens {
         $raw = ($tk.Text -replace '\s', '')
         if ($raw -and $script:ScanLogTokens -ne $false) { $null = $script:ScanLog.Add($raw) }
         if (-not $raw -or $raw.Length -lt 2 -or $raw.Length -gt 20) { continue }
-        $r = $script:MyBoxRect
-        if ($r -and $tk.X -ge $r.X1 -and $tk.X -le $r.X2 -and $tk.Y -ge $r.Y1 -and $tk.Y -le $r.Y2) { continue }
+        $inBox = $false
+        foreach ($r in $script:SkipRects) {
+            if ($tk.X -ge $r.X1 -and $tk.X -le $r.X2 -and $tk.Y -ge $r.Y1 -and $tk.Y -le $r.Y2) { $inBox = $true; break }
+        }
+        if ($inBox) { continue }
         if ($raw -eq $myNick) { $script:SawMyNick = $true }
         # 'N위M국(…%)'는 내 리포트 패널의 순위 분포 줄 - 순위 화면 마커로 오탐하지 않음
         $rk = ($raw -match '^[1-4](위|位)(?!\d+(국|局))')
@@ -1278,11 +1299,13 @@ function Resolve-Tokens {
                         if ($FoundMap.Count -lt 4) {
                             $FoundMap[$key] = @{ Id = $id; Nick = $t; X = $tk.X; Y = $tk.Y }
                             $null = $script:ScanLog.Add(">>> 매칭: $t (id $id)")
+                            Notify-NewFound $FoundMap
                         }
                     } elseif ($t.Length -gt ([string]$FoundMap[$nearKey].Nick).Length) {
                         $FoundMap.Remove($nearKey)
                         $FoundMap[$key] = @{ Id = $id; Nick = $t; X = $tk.X; Y = $tk.Y }
                         $null = $script:ScanLog.Add(">>> 근접 교체: $t (id $id)")
+                        Notify-NewFound $FoundMap
                     } else {
                         $null = $script:ScanLog.Add(">>> 근접 중복 스킵: $t (id $id)")
                     }
@@ -1303,6 +1326,7 @@ function Resolve-Tokens {
                     $fkey = "$fid"
                     if (-not $FoundMap.ContainsKey($fkey)) {
                         $FoundMap[$fkey] = @{ Id = $fid; Nick = $raw; X = $tk.X; Y = $tk.Y }
+                        Notify-NewFound $FoundMap
                     }
                 }
             }
@@ -1320,22 +1344,9 @@ function Scan-Opponents {
     if (-not $script:OcrOk) { return @() }
     $script:ScanLog = New-Object Collections.ArrayList
     $script:ScanQueryLeft = 60   # 스캔 1회당 최대 조회 수 (속도 제한 방지)
-    # 내 오버레이 박스가 가린 영역만 제외 (F8 시점에 부모가 기록한 실시간 좌표, 5분 내 것만 신뢰)
-    $script:MyBoxRect = $null
+    $script:SkipRects = @()
     $script:SawMyNick = $false
-    try {
-        $rf = Join-Path $PSScriptRoot 'scan-box.json'
-        if ((Test-Path $rf) -and ((Get-Date) - (Get-Item $rf).LastWriteTime).TotalMinutes -lt 5) {
-            $bx = Get-Content $rf -Raw | ConvertFrom-Json
-            if ([double]$bx.W -gt 0 -and [double]$bx.H -gt 0) {
-                $script:MyBoxRect = @{
-                    X1 = [double]$bx.X - 8; Y1 = [double]$bx.Y - 8
-                    X2 = [double]$bx.X + [double]$bx.W + 8
-                    Y2 = [double]$bx.Y + [double]$bx.H + 8
-                }
-            }
-        }
-    } catch {}
+    $script:ScanOnProgress = $OnProgress   # 매칭 확정 즉시 1명씩 알림 (Notify-NewFound)
     $found = @{}
     $deadline = (Get-Date).AddSeconds(990)   # 부모의 안전망(999초)보다 조금 먼저 스스로 종료
     $try = 0
@@ -1353,6 +1364,23 @@ function Scan-Opponents {
         $null = $script:ScanLog.Add("===== 시도 $($try + 1) ($(Get-Date -Format 'HH:mm:ss'))")
         $try++
         $prevCount = $found.Count
+        # 오버레이가 가린 영역 갱신: 내 박스 + 부분 표시로 이미 띄워진 상대 박스 (부모가 표시할 때마다 다시 씀, 5분 내 것만 신뢰)
+        $script:SkipRects = @()
+        try {
+            $rf = Join-Path $PSScriptRoot 'scan-box.json'
+            if ((Test-Path $rf) -and ((Get-Date) - (Get-Item $rf).LastWriteTime).TotalMinutes -lt 5) {
+                $bx = Get-Content $rf -Raw | ConvertFrom-Json
+                foreach ($b in (@($bx) + @($bx.Opp))) {
+                    if ($b -and [double]$b.W -gt 0 -and [double]$b.H -gt 0) {
+                        $script:SkipRects += @{
+                            X1 = [double]$b.X - 8; Y1 = [double]$b.Y - 8
+                            X2 = [double]$b.X + [double]$b.W + 8
+                            Y2 = [double]$b.Y + [double]$b.H + 8
+                        }
+                    }
+                }
+            }
+        } catch {}
         $bmp = $null
         try { $bmp = Get-ScreenCapture } catch { continue }
         try {
@@ -1396,7 +1424,8 @@ if ($args.Count -ge 2 -and $args[0] -eq '-TestResolve') {
     $script:Nickname = [string]$sc.MyNick
     $script:SawMyNick = $false
     $script:ScanQueryLeft = 45
-    $script:MyBoxRect = $null
+    $script:SkipRects = @()
+    $script:ScanOnProgress = $null
     $script:ScanLog = New-Object Collections.ArrayList
     $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $tokens = New-Object Collections.ArrayList
@@ -1478,14 +1507,15 @@ if ($riIdx -ge 0) {
 }
 $diIdx = [Array]::IndexOf($args, '-DetailOnce')
 if ($diIdx -ge 0) {
-    # 일간 상세 지표 수집 백그라운드 프로세스: -DetailOnce <yyyy-MM-dd>
+    # 상세 지표 수집 백그라운드 프로세스: -DetailOnce <시작 yyyy-MM-dd> <끝(미포함) yyyy-MM-dd>
     try {
         $pos = Get-Content (Join-Path $PSScriptRoot 'overlay-pos.json') -Raw | ConvertFrom-Json
         if ($pos.Settings.Nickname) { $script:Nickname = [string]$pos.Settings.Nickname }
     } catch {}
-    $day = [DateTime]::ParseExact([string]$args[$diIdx + 1], 'yyyy-MM-dd', $null)
-    $sMs = [DateTimeOffset]::new($day).ToUnixTimeMilliseconds()
-    $eMs = [DateTimeOffset]::new($day.AddDays(1)).ToUnixTimeMilliseconds()
+    $dS = [DateTime]::ParseExact([string]$args[$diIdx + 1], 'yyyy-MM-dd', $null)
+    $dE = [DateTime]::ParseExact([string]$args[$diIdx + 2], 'yyyy-MM-dd', $null)
+    $sMs = [DateTimeOffset]::new($dS).ToUnixTimeMilliseconds()
+    $eMs = [DateTimeOffset]::new($dE).ToUnixTimeMilliseconds()
     $ext = $null; $rst = $null
     try {
         $id = Get-PlayerId
@@ -1493,7 +1523,8 @@ if ($diIdx -ge 0) {
         Start-Sleep -Milliseconds 120
         $ext = Invoke-RestMethod -Uri "$Api/player_extended_stats/$id/$sMs/$eMs`?mode=$($script:Modes)" -TimeoutSec 15
     } catch {}
-    ConvertTo-Json -InputObject @{ Anchor = $day.ToString('yyyy-MM-dd'); Ext = $ext; St = $rst } -Depth 6 | Out-File (Join-Path $PSScriptRoot 'detail-result.json') -Encoding utf8
+    $dKey = ('{0}|{1}' -f $dS.ToString('yyyy-MM-dd'), $dE.ToString('yyyy-MM-dd'))
+    ConvertTo-Json -InputObject @{ Anchor = $dKey; Ext = $ext; St = $rst } -Depth 6 | Out-File (Join-Path $PSScriptRoot 'detail-result.json') -Encoding utf8
     exit 0
 }
 
@@ -1632,9 +1663,13 @@ $BoxXaml = @'
           </StackPanel>
         </StackPanel>
       </StackPanel>
-      <TextBlock x:Name="BtnScan" Text="🔍" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E"
-                 HorizontalAlignment="Left" VerticalAlignment="Top" Margin="-12,-8,0,0" Padding="5,2"
-                 Visibility="Collapsed" Cursor="Hand" ToolTip="상대 스캔" ToolTipService.InitialShowDelay="0"/>
+      <StackPanel x:Name="ScanPanel" Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Top"
+                  Margin="-12,-8,0,0" Visibility="Collapsed">
+        <TextBlock x:Name="BtnScan" Text="🔍" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E"
+                   Padding="5,2" Cursor="Hand" ToolTip="상대 스캔" ToolTipService.InitialShowDelay="0"/>
+        <TextBlock x:Name="BtnCloseOpp" Text="✕" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E"
+                   Padding="5,2" Cursor="Hand" ToolTip="상대 박스 모두 닫기" ToolTipService.InitialShowDelay="0"/>
+      </StackPanel>
       <StackPanel x:Name="CtrlPanel" Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top"
                   Margin="0,-8,-12,0" Visibility="Collapsed">
         <TextBlock x:Name="BtnHelp" Text="?" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E" Padding="5,2" Cursor="Hand"/>
@@ -1795,7 +1830,9 @@ function New-StatWindow {
         TbHelp = $w.FindName('TbHelp')
         SparkCanvas = $w.FindName('SparkCanvas')
         CtrlPanel = $w.FindName('CtrlPanel')
+        ScanPanel = $w.FindName('ScanPanel')
         BtnScan = $w.FindName('BtnScan')
+        BtnCloseOpp = $w.FindName('BtnCloseOpp')
         BtnRefresh = $w.FindName('BtnRefresh')
         BtnReport = $w.FindName('BtnReport')
         BtnSettings = $w.FindName('BtnSettings')
@@ -1880,19 +1917,24 @@ function New-StatWindow {
         $args[1].Handled = $true
         Show-HelpPin $args[0].Tag
     })
-    # 마우스 오버 시에만 버튼들(🔍 / ? ⟳ 📋 ⚙ ◐) 표시
+    # 마우스 오버 시에만 버튼들(🔍 ✕ / ? ⟳ 📋 ⚙ ◐) 표시
     $w.Add_MouseEnter({
         $box.CtrlPanel.Visibility = 'Visible'
-        $box.BtnScan.Visibility = 'Visible'
+        $box.ScanPanel.Visibility = 'Visible'
     }.GetNewClosure())
     $w.Add_MouseLeave({
         $box.CtrlPanel.Visibility = 'Collapsed'
-        $box.BtnScan.Visibility = 'Collapsed'
+        $box.ScanPanel.Visibility = 'Collapsed'
     }.GetNewClosure())
     # 🔍 클릭: 상대 스캔 (F8과 동일)
     $box.BtnScan.Add_MouseLeftButtonDown({
         $args[1].Handled = $true
         Update-Opponents
+    })
+    # ✕ 클릭: 상대 박스 모두 닫기 (F7과 동일)
+    $box.BtnCloseOpp.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        Close-Opponents
     })
     # ⟳ 클릭: 즉시 새로고침 (진행 중엔 ⏳ 표시, 완료 시 토스트)
     $box.BtnRefresh.Add_MouseLeftButtonDown({
@@ -2147,7 +2189,7 @@ function Apply-Theme {
     }
     $Box.RootBorder.Background = New-Brush $bg
     foreach ($tb in @($Box.TbName, $Box.TbRank, $Box.TbGoal, $Box.TbGame, $Box.TbStat, $Box.TbStat2, $Box.TbStat3, $Box.TbStat4, $Box.TbHelp,
-                      $Box.BtnHelp, $Box.BtnSettings, $Box.BtnTheme, $Box.BtnReport, $Box.BtnScan,
+                      $Box.BtnHelp, $Box.BtnSettings, $Box.BtnTheme, $Box.BtnReport, $Box.BtnScan, $Box.BtnCloseOpp,
                       $Box.CbToast, $Box.CbMortal, $Box.CbAnom,
                       $Box.TbBasisMyL, $Box.TbBasisOppL, $Box.TbBasisWarn, $Box.BtnRefresh,
                       $Box.TbKeyScanL, $Box.TbKeyCloseL, $Box.TbKeyExitL, $Box.TbGoalL, $Box.TbBaseL, $Box.TbMinNL, $Box.TbScaleL, $Box.TbShowL, $Box.TbNickL, $Box.BtnNickApply,
@@ -3066,8 +3108,33 @@ function Get-PeriodAnchor {
         }
         'month' { return (New-Object DateTime $D.Year, $D.Month, 1) }
         'year' { return (New-Object DateTime $D.Year, 1, 1) }
+        'all' { return (New-Object DateTime 2010, 1, 1) }
         default { return $D.Date }
     }
+}
+
+# 기간의 [시작, 끝) 날짜 — 상세 지표 조회용. 끝은 내일을 넘지 않게 클램프
+function Get-PeriodRange {
+    param([string]$Mode, [DateTime]$Anchor)
+    $s = Get-PeriodAnchor $Mode $Anchor
+    switch ($Mode) {
+        'week' { $e = $s.AddDays(7) }
+        'season' { $e = $s.AddMonths(3) }
+        'month' { $e = $s.AddMonths(1) }
+        'year' { $e = $s.AddYears(1) }
+        'all' { $e = [DateTime]::Today.AddDays(1) }
+        default { $e = $s.AddDays(1) }
+    }
+    $cap = [DateTime]::Today.AddDays(1)
+    if ($e -gt $cap) { $e = $cap }
+    return @{ S = $s; E = $e }
+}
+
+# 상세 지표 캐시/요청 키: "시작|끝"
+function Get-DetailKey {
+    param([string]$Mode, [DateTime]$Anchor)
+    $r = Get-PeriodRange $Mode $Anchor
+    return ('{0:yyyy-MM-dd}|{1:yyyy-MM-dd}' -f $r.S, $r.E)
 }
 
 $script:ReportXaml = @'
@@ -3081,14 +3148,21 @@ $script:ReportXaml = @'
         <TextBlock x:Name="RcClose" Text="✕" DockPanel.Dock="Right" Foreground="#FF8A93A6" FontFamily="Malgun Gothic" FontSize="14" FontWeight="Bold" Cursor="Hand" Padding="8,0,0,0"/>
         <TextBlock x:Name="RcNext" Text="▶" DockPanel.Dock="Right" Foreground="#FF8A93A6" FontFamily="Malgun Gothic" FontSize="13" FontWeight="Bold" Cursor="Hand" Padding="8,1,0,0"/>
         <TextBlock x:Name="RcPrev" Text="◀" DockPanel.Dock="Right" Foreground="#FF8A93A6" FontFamily="Malgun Gothic" FontSize="13" FontWeight="Bold" Cursor="Hand" Padding="8,1,0,0"/>
+        <TextBlock x:Name="RcCal" Text="📅" DockPanel.Dock="Right" Foreground="#FF8A93A6" FontFamily="Malgun Gothic" FontSize="13" Cursor="Hand" Padding="8,1,0,0" ToolTip="달력에서 기간 선택" ToolTipService.InitialShowDelay="0"/>
         <TextBlock x:Name="RcTitle" FontFamily="Malgun Gothic" FontSize="16" FontWeight="ExtraBold" Foreground="#FFF2F4F8"/>
       </DockPanel>
+      <Popup x:Name="RcCalPop" StaysOpen="False" AllowsTransparency="True" Placement="Bottom" PlacementTarget="{Binding ElementName=RcCal}">
+        <Border Background="#FF1C2233" CornerRadius="8" Padding="8" BorderBrush="#FF2E4266" BorderThickness="1">
+          <Calendar x:Name="RcCalendar"/>
+        </Border>
+      </Popup>
       <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
         <TextBlock x:Name="RcTabDay" Text="일간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
         <TextBlock x:Name="RcTabWeek" Text="주간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
         <TextBlock x:Name="RcTabMonth" Text="월간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
         <TextBlock x:Name="RcTabSeason" Text="시즌" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
-        <TextBlock x:Name="RcTabYear" Text="연간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand"/>
+        <TextBlock x:Name="RcTabYear" Text="연간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
+        <TextBlock x:Name="RcTabAll" Text="전체" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand"/>
       </StackPanel>
       <TextBlock x:Name="RcSeq" FontFamily="Malgun Gothic" FontSize="22" FontWeight="ExtraBold" Margin="0,12,0,0" Foreground="#FFF2F4F8"/>
       <TextBlock x:Name="RcStats" FontFamily="Malgun Gothic" FontSize="14" FontWeight="Bold" Foreground="#FFD9DCE1" Margin="0,8,0,0"/>
@@ -3120,11 +3194,22 @@ $script:ReportXaml = @'
 
 function Set-ReportTabs {
     param($Rw, [string]$Mode)
-    $map = @{ day = 'RcTabDay'; week = 'RcTabWeek'; month = 'RcTabMonth'; season = 'RcTabSeason'; year = 'RcTabYear' }
+    $map = @{ day = 'RcTabDay'; week = 'RcTabWeek'; month = 'RcTabMonth'; season = 'RcTabSeason'; year = 'RcTabYear'; all = 'RcTabAll' }
     foreach ($m in $map.Keys) {
         $tb = $Rw.FindName($map[$m])
         if ($m -eq $Mode) { $tb.Opacity = 1.0; $tb.TextDecorations = [Windows.TextDecorations]::Underline }
         else { $tb.Opacity = 0.45; $tb.TextDecorations = $null }
+    }
+    # 전체 탭은 이동할 이전/다음 기간이 없으므로 달력·화살표 숨김
+    $navVis = 'Visible'
+    if ($Mode -eq 'all') { $navVis = 'Collapsed' }
+    foreach ($nm in @('RcCal', 'RcPrev', 'RcNext')) {
+        $el = $Rw.FindName($nm)
+        if ($el) { $el.Visibility = $navVis }
+    }
+    if ($Mode -eq 'all') {
+        $pop = $Rw.FindName('RcCalPop')
+        if ($pop) { $pop.IsOpen = $false }
     }
 }
 
@@ -3182,8 +3267,8 @@ function Add-InfoRow {
     $null = $Panel.Children.Add($dp)
 }
 
-# 일간 상세 지표 렌더 (화료/방총/리치 등 — 율과 횟수 병기)
-function Fill-DayDetail {
+# 상세 지표 렌더 (화료/방총/리치 등 — 율과 횟수 병기, 모든 기간 공용)
+function Fill-DetailStats {
     param($Rw, $Res)
     try {
         $grid = $Rw.FindName('RcDetailGrid')
@@ -3264,7 +3349,7 @@ function Fill-ReportContent {
         $bks = @()
         if ($Pack.Buckets) { $bks = @($Pack.Buckets | ForEach-Object { $_ }) }
         $unit = ''
-        if ($mode -eq 'week') { $unit = '요일' } elseif ($mode -eq 'month') { $unit = '일' } elseif ($mode -eq 'year') { $unit = '월' } elseif ($mode -eq 'season') { $unit = '주차' }
+        if ($mode -eq 'week') { $unit = '요일' } elseif ($mode -eq 'month') { $unit = '일' } elseif ($mode -eq 'year') { $unit = '월' } elseif ($mode -eq 'season') { $unit = '주차' } elseif ($mode -eq 'all') { $unit = '년' }
 
         $titleTxt = [string]$Pack.Title
         if ($mode -eq 'day' -and ([string]$Pack.Anchor) -eq ([DateTime]::Today.ToString('yyyy-MM-dd'))) { $titleTxt += ' (오늘)' }
@@ -3657,15 +3742,15 @@ function Fill-ReportContent {
             if ($busiest) { Add-InfoRow $grid '최다 대국' ('{0}{1} ({2}국)' -f [string]$busiest.Label, $unit, [int]$busiest.N) }
         }
 
-        # 상세 지표 (일간 전용, 버튼 클릭 시 백그라운드 로딩)
+        # 상세 지표 (모든 기간, 버튼 클릭 시 백그라운드 로딩)
         $dBtn = $Rw.FindName('RcDetailBtn')
         $Rw.FindName('RcDetailGrid').Children.Clear()
-        if ($mode -eq 'day' -and $n -gt 0) {
-            $anchorStr = [string]$Pack.Anchor
-            if ($script:DetailCache.ContainsKey($anchorStr)) {
+        if ($n -gt 0) {
+            $dKey = Get-DetailKey $mode ([DateTime]::ParseExact([string]$Pack.Anchor, 'yyyy-MM-dd', $null))
+            if ($script:DetailCache.ContainsKey($dKey)) {
                 $dBtn.Visibility = 'Collapsed'
-                Fill-DayDetail $Rw $script:DetailCache[$anchorStr]
-            } elseif ($script:DetailProc -and -not $script:DetailProc.HasExited -and $script:DetailReqAnchor -eq $anchorStr) {
+                Fill-DetailStats $Rw $script:DetailCache[$dKey]
+            } elseif ($script:DetailProc -and -not $script:DetailProc.HasExited -and $script:DetailReqAnchor -eq $dKey) {
                 $dBtn.Text = '상세 지표 불러오는 중...'
                 $dBtn.Visibility = 'Visible'
             } else {
@@ -3796,6 +3881,7 @@ function Show-ReportCard {
         $rw.FindName('RcTabMonth').Tag = 'month'
         $rw.FindName('RcTabSeason').Tag = 'season'
         $rw.FindName('RcTabYear').Tag = 'year'
+        $rw.FindName('RcTabAll').Tag = 'all'
         $tabHandler = {
             $args[1].Handled = $true
             $m = [string]$args[0].Tag
@@ -3804,7 +3890,7 @@ function Show-ReportCard {
             if ($script:ReportAnchors.ContainsKey($m)) { $a = [DateTime]$script:ReportAnchors[$m] }
             Request-Report $m (Get-PeriodAnchor $m $a)
         }
-        foreach ($tn in @('RcTabDay', 'RcTabWeek', 'RcTabMonth', 'RcTabSeason', 'RcTabYear')) {
+        foreach ($tn in @('RcTabDay', 'RcTabWeek', 'RcTabMonth', 'RcTabSeason', 'RcTabYear', 'RcTabAll')) {
             $rw.FindName($tn).Add_MouseLeftButtonDown($tabHandler)
         }
         # ◀ ▶ 기간 이동
@@ -3813,6 +3899,7 @@ function Show-ReportCard {
             $w = [Windows.Window]::GetWindow($args[0])
             $st = $w.Tag
             $m = [string]$st.Mode
+            if ($m -eq 'all') { return }
             $a = [DateTime]$st.Anchor
             switch ($m) {
                 'week' { $a = $a.AddDays(-7) }
@@ -3828,6 +3915,7 @@ function Show-ReportCard {
             $w = [Windows.Window]::GetWindow($args[0])
             $st = $w.Tag
             $m = [string]$st.Mode
+            if ($m -eq 'all') { return }
             $a = [DateTime]$st.Anchor
             switch ($m) {
                 'week' { $a = $a.AddDays(7) }
@@ -3840,22 +3928,58 @@ function Show-ReportCard {
             if ($a -gt (Get-PeriodAnchor $m ([DateTime]::Today))) { return }
             Request-Report $m $a
         })
-        # 상세 지표 로딩 (일간 전용) - 리포트 다른 부분은 그대로 두고 이 영역만 백그라운드로 채움
+        # 📅 달력에서 날짜를 골라 해당 기간으로 이동 (전체 탭 제외)
+        $rw.FindName('RcCalPop').Add_Closed({ $script:CalPopClosed = Get-Date })
+        $rw.FindName('RcCal').Add_MouseLeftButtonDown({
+            $args[1].Handled = $true
+            $w = [Windows.Window]::GetWindow($args[0])
+            $st = $w.Tag
+            if ([string]$st.Mode -eq 'all') { return }
+            $pop = $w.FindName('RcCalPop')
+            # 팝업이 열린 상태에서 📅를 다시 누르면 바깥 클릭으로 이미 닫힌 직후라 재오픈 방지
+            if ($pop.IsOpen) { $pop.IsOpen = $false; return }
+            if ($script:CalPopClosed -and ((Get-Date) - $script:CalPopClosed).TotalMilliseconds -lt 250) { return }
+            $cal = $w.FindName('RcCalendar')
+            $script:CalSyncing = $true
+            try {
+                $cal.DisplayDateEnd = [DateTime]::Today
+                $cal.SelectedDate = [DateTime]$st.Anchor
+                $cal.DisplayDate = [DateTime]$st.Anchor
+            } catch {}
+            $script:CalSyncing = $false
+            $pop.IsOpen = $true
+        })
+        $rw.FindName('RcCalendar').Add_SelectedDatesChanged({
+            if ($script:CalSyncing) { return }
+            # 달력이 마우스를 붙잡고 있으면 다음 클릭이 먹히는 WPF 버그 해제
+            try { [Windows.Input.Mouse]::Capture($null) } catch {}
+            $cal = $args[0]
+            if ($null -eq $cal.SelectedDate) { return }
+            $d = ([DateTime]$cal.SelectedDate).Date
+            $w = $script:ReportWin
+            if (-not $w) { return }
+            $st = $w.Tag
+            $m = [string]$st.Mode
+            if ($m -eq 'all') { return }
+            $w.FindName('RcCalPop').IsOpen = $false
+            Request-Report $m (Get-PeriodAnchor $m $d)
+        })
+        # 상세 지표 로딩 (모든 기간) - 리포트 다른 부분은 그대로 두고 이 영역만 백그라운드로 채움
         $rw.FindName('RcDetailBtn').Add_MouseLeftButtonDown({
             $args[1].Handled = $true
             $w = [Windows.Window]::GetWindow($args[0])
             $st = $w.Tag
-            if ([string]$st.Mode -ne 'day') { return }
-            $anchorStr = ([DateTime]$st.Anchor).ToString('yyyy-MM-dd')
-            if ($script:DetailCache.ContainsKey($anchorStr)) { return }
+            $r = Get-PeriodRange ([string]$st.Mode) ([DateTime]$st.Anchor)
+            $dKey = ('{0:yyyy-MM-dd}|{1:yyyy-MM-dd}' -f $r.S, $r.E)
+            if ($script:DetailCache.ContainsKey($dKey)) { return }
             if ($script:DetailProc -and -not $script:DetailProc.HasExited) {
                 Show-Toast '이미 상세 지표를 불러오는 중이에요' $false
                 return
             }
             try { Remove-Item (Join-Path $PSScriptRoot 'detail-result.json') -Force -ErrorAction SilentlyContinue } catch {}
-            $script:DetailReqAnchor = $anchorStr
+            $script:DetailReqAnchor = $dKey
             $script:DetailStart = Get-Date
-            $script:DetailProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-DetailOnce', $anchorStr
+            $script:DetailProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-DetailOnce', $r.S.ToString('yyyy-MM-dd'), $r.E.ToString('yyyy-MM-dd')
             $args[0].Text = '상세 지표 불러오는 중...'
             $script:DetailPollTimer.Start()
         })
@@ -3899,6 +4023,8 @@ $script:ReportReqKey = ''
 $script:ReportCache = @{}
 $script:ReportAnchors = @{}
 $script:ReportWin = $null
+$script:CalSyncing = $false
+$script:CalPopClosed = $null
 $reportPollTimer = New-Object Windows.Threading.DispatcherTimer
 $reportPollTimer.Interval = [TimeSpan]::FromMilliseconds(500)
 $reportPollTimer.Add_Tick({
@@ -3955,20 +4081,23 @@ $detailPollTimer.Add_Tick({
     $res = $null
     try { $res = Get-Content (Join-Path $PSScriptRoot 'detail-result.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
     $ok = ($res -and $res.Ext -and $null -ne $res.Ext.count)
-    # 오늘 날짜는 대국이 계속 추가되므로 캐시하지 않음
-    if ($ok -and ([string]$res.Anchor) -ne ([DateTime]::Today.ToString('yyyy-MM-dd'))) {
-        $script:DetailCache[[string]$res.Anchor] = $res
+    # 기간이 오늘을 포함하면 대국이 계속 추가되므로 캐시하지 않음
+    if ($ok) {
+        try {
+            $endD = [DateTime]::ParseExact((([string]$res.Anchor) -split '\|')[1], 'yyyy-MM-dd', $null)
+            if ($endD -le [DateTime]::Today) { $script:DetailCache[[string]$res.Anchor] = $res }
+        } catch {}
     }
     $rw = $script:ReportWin
     if (-not $rw) { return }
     try {
         $cur = $rw.Tag
-        if ([string]$cur.Mode -ne 'day') { return }
-        if ((([DateTime]$cur.Anchor).ToString('yyyy-MM-dd')) -ne $script:DetailReqAnchor) { return }
+        $curKey = Get-DetailKey ([string]$cur.Mode) ([DateTime]$cur.Anchor)
+        if ($curKey -ne $script:DetailReqAnchor) { return }
         $btn = $rw.FindName('RcDetailBtn')
         if ($ok) {
             $btn.Visibility = 'Collapsed'
-            Fill-DayDetail $rw $res
+            Fill-DetailStats $rw $res
         } else {
             $btn.Text = '상세 지표 불러오기 실패 — 다시 시도'
         }
@@ -4068,6 +4197,32 @@ function Update-Overlay {
 }
 
 # --- 상대 박스 ---
+# 스캔 프로세스가 오버레이가 가린 부분을 건너뛰도록 실시간 좌표 전달 (내 박스 + 이미 띄워진 상대 박스)
+function Write-ScanBoxFile {
+    try {
+        $w0 = $script:MyBox.Win
+        $rect = @{
+            X = [double]$w0.Left * $script:DpiScale
+            Y = [double]$w0.Top * $script:DpiScale
+            W = [math]::Max(220, [double]$w0.ActualWidth) * $script:DpiScale
+            H = [math]::Max(80, [double]$w0.ActualHeight) * $script:DpiScale
+        }
+        $opp = @()
+        foreach ($k in @($script:OppWindows.Keys)) {
+            $ow = $script:OppWindows[$k].Win
+            if (-not $ow.IsVisible) { continue }
+            $opp += @{
+                X = [double]$ow.Left * $script:DpiScale
+                Y = [double]$ow.Top * $script:DpiScale
+                W = [math]::Max(220, [double]$ow.ActualWidth) * $script:DpiScale
+                H = [math]::Max(80, [double]$ow.ActualHeight) * $script:DpiScale
+            }
+        }
+        $rect.Opp = $opp
+        ConvertTo-Json -InputObject $rect -Depth 4 | Out-File (Join-Path $PSScriptRoot 'scan-box.json') -Encoding utf8
+    } catch {}
+}
+
 # F8: 스캔을 별도 프로세스에서 실행 (UI는 계속 반응) - 완료는 ScanPollTimer가 감지
 function Update-Opponents {
     if (-not $script:OcrOk) { return }
@@ -4076,16 +4231,9 @@ function Update-Opponents {
     Show-ScanIndicator
     $resFile = Join-Path $PSScriptRoot 'scan-result.json'
     try { Remove-Item $resFile -Force -ErrorAction SilentlyContinue } catch {}
-    # 스캔 프로세스가 내 박스가 가린 부분만 건너뛰도록 실시간 좌표 전달
-    try {
-        $w0 = $script:MyBox.Win
-        @{
-            X = [double]$w0.Left * $script:DpiScale
-            Y = [double]$w0.Top * $script:DpiScale
-            W = [math]::Max(220, [double]$w0.ActualWidth) * $script:DpiScale
-            H = [math]::Max(80, [double]$w0.ActualHeight) * $script:DpiScale
-        } | ConvertTo-Json | Out-File (Join-Path $PSScriptRoot 'scan-box.json') -Encoding utf8
-    } catch {}
+    Write-ScanBoxFile
+    $script:ScanShownWrite = $null
+    $script:ScanBoxRefresh = 0
     $script:ScanStartTime = Get-Date
     $script:ScanProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-ScanOnce'
     $script:ScanPollTimer.Start()
@@ -4094,6 +4242,15 @@ function Update-Opponents {
 # 스캔 결과(JSON)로 상대 박스 표시
 function Show-OpponentResult {
     param($Entries)
+    # 결과에서 빠진 상대의 박스는 정리 (부분 표시 후 근접 교체로 다른 계정이 된 경우)
+    $keep = @{}
+    foreach ($o in $Entries) { $keep[[string]$o.Id] = $true }
+    foreach ($k in @($script:OppWindows.Keys)) {
+        if (-not $keep.ContainsKey($k)) {
+            try { $script:OppWindows[$k].Win.Close() } catch {}
+            $script:OppWindows.Remove($k)
+        }
+    }
     foreach ($o in $Entries) {
         $d = $o.Data
         if (-not $d) { continue }
@@ -4200,6 +4357,8 @@ $script:ScanProc = $null
 $script:ScanStartTime = $null
 $script:ScanIndicator = $null
 $script:LastScanSecs = 50
+$script:ScanShownWrite = $null   # 부분 결과 파일에서 마지막으로 표시한 시점
+$script:ScanBoxRefresh = 0       # 상대 박스가 새로 뜬 뒤 scan-box.json 재기록 횟수
 $scanPollTimer = New-Object Windows.Threading.DispatcherTimer
 $scanPollTimer.Interval = [TimeSpan]::FromMilliseconds(400)
 $scanPollTimer.Add_Tick({
@@ -4215,6 +4374,30 @@ $scanPollTimer.Add_Tick({
             try { $script:ScanIndicator.FindName('TbScanMain').Text = "🔍 상대 스캔 중... $sec`초" } catch {}
             # 비정상 상황 안전망 (999초)
             if ($sec -gt 999) { try { $script:ScanProc.Kill() } catch {} }
+        }
+        # 스캔이 끝나기 전에도 확정된 상대는 즉시 표시 (자식이 찾는 즉시 저장하는 부분 결과 감지)
+        try {
+            $resFile = Join-Path $PSScriptRoot 'scan-result.json'
+            if (Test-Path $resFile) {
+                $wt = (Get-Item $resFile).LastWriteTimeUtc
+                if ($wt -ne $script:ScanShownWrite) {
+                    $entries = @(Get-Content $resFile -Raw -Encoding UTF8 | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ })
+                    if ($entries.Count -gt 0) {
+                        Show-OpponentResult $entries
+                        $script:ScanShownWrite = $wt
+                        # 새로 뜬 박스 좌표를 자식에 전달 - 박스 안 텍스트가 다음 재시도의 OCR 잡음이 되지 않게
+                        # (표시 직후엔 레이아웃 전이라 크기가 0일 수 있어 다음 틱에 한 번 더 씀)
+                        $script:ScanBoxRefresh = 2
+                        if ($script:ScanIndicator) {
+                            try { $script:ScanIndicator.FindName('TbScanSub').Text = "$($entries.Count)명 표시됨 · 클릭하면 여기까지 결과로 중지" } catch {}
+                        }
+                    }
+                }
+            }
+        } catch {}
+        if ($script:ScanBoxRefresh -gt 0) {
+            Write-ScanBoxFile
+            $script:ScanBoxRefresh--
         }
         return
     }
