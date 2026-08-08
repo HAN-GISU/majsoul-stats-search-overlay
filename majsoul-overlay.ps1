@@ -3661,7 +3661,7 @@ function Fill-ReportContent {
                 elseif ($diff -ge 80) { $comment = '📈 수확의 날이네요' }
                 elseif ($diff -gt 0) { $comment = '👍 준수한 하루' }
                 elseif ($diff -eq 0) { $comment = '무난한 하루였습니다' }
-                elseif ($lastRate -ge 0.5 -and $n -ge 4) { $comment = '⚰️ 오늘은 라스의 날... 자리 탓 합시다' }
+                elseif ($lastRate -ge 0.5 -and $n -ge 4) { $comment = '⚰️ 오늘은 라스의 날' }
                 elseif ($diff -le -200 -or ($pg -le -30 -and $n -ge 3)) { $comment = '💀 이 날은 접는 게 나았을지도...' }
                 elseif ($diff -le -80 -or ($pg -le -15 -and $n -ge 3)) { $comment = '🩸 꽤 아픈 하루였네요' }
                 else { $comment = '📉 내일의 나를 믿읍시다' }
