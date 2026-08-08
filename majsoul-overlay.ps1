@@ -961,6 +961,14 @@ foreach ($pr in @('アァ', 'イィ', 'ウゥ', 'エェ', 'オォ', 'ヤャ', '�
     $script:KanaAlt[$a] += $b
     $script:KanaAlt[$b] += $a
 }
+# 바탕 글자 모양 혼동 (탁점은 제대로 읽은 경우: ハイグ → ハイゲ). 탁점을 지우는 대안보다 먼저 시도되게 앞에 삽입
+foreach ($pr in @('クケ', 'グゲ', 'ソン', 'シツ', 'くけ', 'ぐげ')) {
+    $a = [string]$pr[0]; $b = [string]$pr[1]
+    if (-not $script:KanaAlt.ContainsKey($a)) { $script:KanaAlt[$a] = @() }
+    if (-not $script:KanaAlt.ContainsKey($b)) { $script:KanaAlt[$b] = @() }
+    $script:KanaAlt[$a] = @($b) + $script:KanaAlt[$a]
+    $script:KanaAlt[$b] = @($a) + $script:KanaAlt[$b]
+}
 
 function Get-TokenVariants {
     param([string]$Raw, [bool]$Deep = $false)
@@ -1152,12 +1160,13 @@ function Resolve-Tokens {
     $hasRank = $false
     foreach ($tk in $Tokens) {
         $raw = ($tk.Text -replace '\s', '')
-        if ($raw) { $null = $script:ScanLog.Add($raw) }
+        if ($raw -and $script:ScanLogTokens -ne $false) { $null = $script:ScanLog.Add($raw) }
         if (-not $raw -or $raw.Length -lt 2 -or $raw.Length -gt 20) { continue }
         $r = $script:MyBoxRect
         if ($r -and $tk.X -ge $r.X1 -and $tk.X -le $r.X2 -and $tk.Y -ge $r.Y1 -and $tk.Y -le $r.Y2) { continue }
         if ($raw -eq $myNick) { $script:SawMyNick = $true }
-        $rk = ($raw -match '^[1-4](위|位)')
+        # 'N위M국(…%)'는 내 리포트 패널의 순위 분포 줄 - 순위 화면 마커로 오탐하지 않음
+        $rk = ($raw -match '^[1-4](위|位)(?!\d+(국|局))')
         if ($rk) {
             $hasRank = $true
             if (($raw -replace '^[1-4](위|位)', '') -eq $myNick) { $script:SawMyNick = $true }
@@ -1305,8 +1314,9 @@ function Resolve-Tokens {
     }
 }
 
-# 스캔 오케스트레이션: 전체 스캔 → 부족하면 정밀 스캔, 최대 3회 재촬영. 과정은 scan-log.txt에 기록
+# 스캔 오케스트레이션: 전체 스캔 → 부족하면 정밀 스캔, 다 찾거나 시간이 다할 때까지 재촬영. 과정은 scan-log.txt에 기록
 function Scan-Opponents {
+    param([scriptblock]$OnProgress = $null)
     if (-not $script:OcrOk) { return @() }
     $script:ScanLog = New-Object Collections.ArrayList
     $script:ScanQueryLeft = 60   # 스캔 1회당 최대 조회 수 (속도 제한 방지)
@@ -1327,18 +1337,27 @@ function Scan-Opponents {
         }
     } catch {}
     $found = @{}
-    for ($try = 0; $try -lt 3; $try++) {
+    $deadline = (Get-Date).AddSeconds(990)   # 부모의 안전망(999초)보다 조금 먼저 스스로 종료
+    $try = 0
+    while ($true) {
         # 목표 인원: 화면에 내 닉이 보이면(=내 대국) 3명, 아니면(관전 등) 4명
         $target = 4
         if ($script:SawMyNick) { $target = 3 }
         if ($found.Count -ge $target) { break }
-        if ($try -gt 0) { Start-Sleep -Milliseconds 500 }
+        if ((Get-Date) -ge $deadline) { break }
+        if ($try -gt 0) { Start-Sleep -Milliseconds $(if ($try -lt 3) { 500 } else { 2000 }) }
+        # 재시도마다 조회 예산 소량 리필 (재시도는 대부분 캐시 히트라 실제 추가 조회는 적음)
+        if ($try -gt 0 -and $script:ScanQueryLeft -lt 30) { $script:ScanQueryLeft = 30 }
+        # 로그 폭주 방지: 4회차부터는 토큰 원문 생략(매칭 결과 줄만 기록)
+        $script:ScanLogTokens = ($try -lt 3)
         $null = $script:ScanLog.Add("===== 시도 $($try + 1) ($(Get-Date -Format 'HH:mm:ss'))")
+        $try++
+        $prevCount = $found.Count
         $bmp = $null
         try { $bmp = Get-ScreenCapture } catch { continue }
         try {
             $fullT = Get-FullTokens $bmp
-            $isRankScreen = (@($fullT | Where-Object { ($_.Text -replace '\s', '') -match '^[1-4](위|位)' }).Count -gt 0)
+            $isRankScreen = (@($fullT | Where-Object { ($_.Text -replace '\s', '') -match '^[1-4](위|位)(?!\d+(국|局))' }).Count -gt 0)
             if ($isRankScreen) {
                 # 순위 화면(패보/결과 목록): 명패 밴드 무의미 - 순위 목록만 처리
                 $null = $script:ScanLog.Add('--- 순위 화면 스캔')
@@ -1360,6 +1379,10 @@ function Scan-Opponents {
             $null = $script:ScanLog.Add("오류: $($_.Exception.Message)")
         }
         if ($bmp) { $bmp.Dispose() }
+        # 중간에 강제 종료돼도 과정을 볼 수 있게 시도마다 기록
+        try { ($script:ScanLog -join "`r`n") | Out-File (Join-Path $PSScriptRoot 'scan-log.txt') -Encoding utf8 } catch {}
+        # 새로 찾은 상대는 즉시 알림 - 사용자가 클릭으로 중지해도 여기까지는 표시됨
+        if ($OnProgress -and $found.Count -gt $prevCount) { try { & $OnProgress @($found.Values) } catch {} }
     }
     try { ($script:ScanLog -join "`r`n") | Out-File (Join-Path $PSScriptRoot 'scan-log.txt') -Encoding utf8 } catch {}
     return @($found.Values)
@@ -1421,18 +1444,23 @@ if ($args -contains '-ScanOnce') {
         if ($pos.Settings.Nickname) { $script:Nickname = [string]$pos.Settings.Nickname }
         if ($null -ne $pos.Settings.OppMinN) { $script:Settings.OppMinN = [int]$pos.Settings.OppMinN }
     } catch {}
-    $opps = Scan-Opponents
-    $out = @()
     $resPath = Join-Path $PSScriptRoot 'scan-result.json'
-    foreach ($o in $opps) {
-        $d = Get-OpponentData $o.Id
-        if ($d) {
-            $out += [pscustomobject]@{ Id = "$($o.Id)"; X = [double]$o.X; Y = [double]$o.Y; Data = $d }
-            # 부분 결과 즉시 저장 - 시간 초과로 종료돼도 여기까지의 상대는 표시됨
-            ConvertTo-Json -InputObject $out -Depth 6 | Out-File $resPath -Encoding utf8
+    $dataCache = @{}
+    # 찾은 상대들의 데이터를 조회해 즉시 저장 - 스캔 도중 중지/강제 종료돼도 여기까지의 상대는 표시됨
+    $saveOpps = {
+        param($Opps)
+        $out = @()
+        foreach ($o in $Opps) {
+            $key = "$($o.Id)"
+            if (-not $dataCache[$key]) { $dataCache[$key] = Get-OpponentData $o.Id }
+            if ($dataCache[$key]) {
+                $out += [pscustomobject]@{ Id = $key; X = [double]$o.X; Y = [double]$o.Y; Data = $dataCache[$key] }
+            }
         }
+        ConvertTo-Json -InputObject $out -Depth 6 | Out-File $resPath -Encoding utf8
     }
-    ConvertTo-Json -InputObject $out -Depth 6 | Out-File $resPath -Encoding utf8
+    $opps = Scan-Opponents -OnProgress $saveOpps
+    & $saveOpps $opps
     exit 0
 }
 $riIdx = [Array]::IndexOf($args, '-ReportOnce')
@@ -4115,7 +4143,7 @@ function Show-ScanIndicator {
         $iw = [Windows.Markup.XamlReader]::Parse($x)
         $est = [int]$script:LastScanSecs
         if ($est -le 0) { $est = 50 }
-        $iw.FindName('TbScanSub').Text = "예상 약 $est`초 · 클릭하면 여기까지 결과로 중지"
+        $iw.FindName('TbScanSub').Text = "보통 약 $est`초 · 클릭하면 여기까지 결과로 중지"
         $iw.Left = $script:MyBox.Win.Left
         $iw.Top = $script:MyBox.Win.Top - 64
         if ($iw.Top -lt 0) { $iw.Top = $script:MyBox.Win.Top + 150 }
@@ -4192,10 +4220,8 @@ $scanPollTimer.Add_Tick({
     }
     $script:ScanProc = $null
     $script:ScanPollTimer.Stop()
-    if ($script:ScanStartTime) {
-        $took = [int]((Get-Date) - $script:ScanStartTime).TotalSeconds
-        if ($took -ge 5 -and $took -le 300) { $script:LastScanSecs = $took }
-    }
+    $took = 0
+    if ($script:ScanStartTime) { $took = [int]((Get-Date) - $script:ScanStartTime).TotalSeconds }
     Hide-ScanIndicator
     $resFile = Join-Path $PSScriptRoot 'scan-result.json'
     $entries = @()
@@ -4207,6 +4233,8 @@ $scanPollTimer.Add_Tick({
     if ($entries.Count -eq 0) {
         Show-Toast '상대를 찾지 못했어요 😥' $false
     } else {
+        # '보통 N초' 표시는 성공한 스캔의 소요 시간만 반영
+        if ($took -ge 5 -and $took -le 300) { $script:LastScanSecs = $took }
         Show-OpponentResult $entries
     }
 })
