@@ -1,6 +1,6 @@
 ﻿# ═══════════════════════════════════════════════════════════
 #  작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
-#  v1.0.1  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
+#  v1.0.3  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
 #  데이터: amae-koromo(雀魂牌谱屋) 공개 API — 게임에 개입하지 않음
 # ═══════════════════════════════════════════════════════════
 
@@ -13,7 +13,23 @@ $AutoScanMinutes = 0                # 상대 자동 스캔 주기(분), 0이면 
 # 단축키: F8 = 지금 화면 스캔해서 상대 전적 띄우기, F7 = 상대 박스 모두 닫기
 # ================================================
 
-Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class Native{[DllImport("user32.dll")]public static extern bool SetProcessDPIAware();[DllImport("user32.dll")]public static extern short GetAsyncKeyState(int vKey);}'
+Add-Type -TypeDefinition @'
+using System; using System.Text; using System.Runtime.InteropServices;
+public static class Native {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+  public struct RECT { public int L, T, R, B; }
+  public struct POINT { public int X, Y; }
+  public delegate bool EnumProc(IntPtr h, IntPtr p);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint procId);
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+}
+'@
 $null = [Native]::SetProcessDPIAware()
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -32,6 +48,9 @@ $script:TodaySeq = @()
 $script:TodayPts = @()
 $script:TodayLvls = @()
 $script:BaselinePt = $null
+$script:BaselineTotal = $null   # 기준 시점까지의 총 국수 (서버 집계 지연 감지용)
+$script:BaseCheckedAt = $null   # 마지막으로 기준을 재조회한 시점의 전체 국수
+$script:SeqDoneMs = $null       # 순위 시퀀스를 복원해둔 시점 (이후 구간만 추가 조회)
 $script:AnnouncedCount = -1  # 토스트 알림 기준 판 수
 $script:LastShownPt = $null
 $script:SessionStartMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -603,13 +622,19 @@ function Get-RankLine {
 function Get-OverlayData {
     $id = Get-PlayerId
     $todayMidnight = [DateTimeOffset]::new([DateTime]::Today).ToUnixTimeMilliseconds()
+    $queryMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()   # 이 조회에 포함된 판의 상한 (순위 복원 이어붙이기 기준)
     $nowPlus = [DateTimeOffset]::UtcNow.AddHours(2).ToUnixTimeMilliseconds()
     # 기준 시점: 오늘 0시 또는 오버레이 실행 시점
     $baseMs = $todayMidnight
     if ([string]$script:Settings.SessionBase -eq 'session') { $baseMs = [long]$script:SessionStartMs }
 
-    if ($script:TodayDate -ne [DateTime]::Today) {
-        $script:TodayDate = [DateTime]::Today
+    # 날짜가 바뀌면 '오늘' 누적을 리셋. 단 '실행 시점부터' 기준은 날짜와 무관하므로 건너뛴다
+    # (며칠 켜둬도 세션 누적/목표 축하가 자정에 끊기지 않게)
+    $rollover = [bool]$script:ForceReset -or
+                (($script:TodayDate -ne [DateTime]::Today) -and ([string]$script:Settings.SessionBase -ne 'session'))
+    $script:ForceReset = $false
+    $script:TodayDate = [DateTime]::Today
+    if ($rollover) {
         $script:TodayCount = -1
         $script:TodaySeq = @()
         $script:TodayPts = @()
@@ -617,54 +642,97 @@ function Get-OverlayData {
         $script:AnnouncedCount = -1
         $script:BaselinePt = $null
         $script:BaselineLvl = $null
+        $script:BaselineTotal = $null
+        $script:BaseCheckedAt = $null
+        $script:SeqDoneMs = $null
         $script:GoalCelebrated = $null
     }
 
     $statStart = Get-BasisStart $id $nowPlus $script:Settings.MyBasis
     $stats = Get-RangeStats $id $statStart $nowPlus
+    # 기준 구간에 판이 없으면 API가 404를 준다 ('기준 시점 이후'로 막 바꾼 직후 등).
+    # 실패로 볼 일이 아니므로 이름/랭크는 전체 기준으로 채우고 표본이 필요한 값만 비운다.
+    $emptyBasis = (-not $stats)
+    if ($emptyBasis) { $stats = Get-RangeStats $id $EpochStart $nowPlus }
     if (-not $stats) { throw '전적 조회 실패' }
     # 랭크/점수는 통계 기준과 무관하게 항상 전체 기간 기준 (승단 즉시 반영)
     $fullStats = $stats
-    if ($statStart -ne $EpochStart) {
+    if (-not $emptyBasis -and $statStart -ne $EpochStart) {
         $f = Get-RangeStats $id $EpochStart $nowPlus
         if ($f) { $fullStats = $f }
     }
     # 통산 통계(화료율 등)는 잘 안 변하므로 10분에 한 번만 조회
-    if ($null -eq $script:ExtCache -or ([DateTime]::Now - $script:ExtCacheTime).TotalSeconds -gt 600) {
-        $script:ExtCache = Invoke-Api "$Api/player_extended_stats/$id/$statStart/$nowPlus`?mode=$($script:Modes)" 15
+    if ($emptyBasis) {
+        $script:ExtCache = $null
+        $script:ExtCacheTime = [DateTime]::Now
+    } elseif ($null -eq $script:ExtCache -or ([DateTime]::Now - $script:ExtCacheTime).TotalSeconds -gt 600) {
+        # 구간이 비면 여기도 404 - 실패해도 전체 갱신을 멈추지 않음
+        try { $script:ExtCache = Invoke-Api "$Api/player_extended_stats/$id/$statStart/$nowPlus`?mode=$($script:Modes)" 15 }
+        catch { $script:ExtCache = $null }
         $script:ExtCacheTime = [DateTime]::Now
     }
     $ext = $script:ExtCache
 
+    $today = Get-RangeStats $id $baseMs $nowPlus
+    $todayCount = 0
+    if ($today) { $todayCount = $today.count }
+
     # 오늘 0시 시점 점수/단위 (오늘 변동 계산용)
-    if ($null -eq $script:BaselinePt) {
+    # 서버 집계 캐시가 늦으면 기준 조회가 직전 판을 빠뜨린 채 굳어버린다 ("오늘 0국인데 ▼6").
+    # 기준 시점까지의 국수 + 오늘 국수 = 전체 국수가 맞지 않으면 기준을 다시 잡는다.
+    $needBase = ($null -eq $script:BaselinePt)
+    if (-not $needBase -and ([int]$script:BaselineTotal + $todayCount) -ne [int]$fullStats.count -and
+        $script:BaseCheckedAt -ne [int]$fullStats.count) { $needBase = $true }
+    if ($needBase) {
+        $script:BaseCheckedAt = [int]$fullStats.count   # 같은 국수로는 한 번만 재조회
         $before = Get-RangeStats $id $EpochStart $baseMs
         if ($before) {
             $effB = Get-EffectiveLevel $before.level
             $script:BaselinePt = $effB.Pt
             $script:BaselineLvl = $effB.Id
-        } else {
+            $script:BaselineTotal = [int]$before.count
+        } elseif ($null -eq $script:BaselinePt) {
+            # 기준 시점 이전 기록이 없음 (신규 계정 등) - 현재 값을 기준으로
             $effB = Get-EffectiveLevel $fullStats.level
             $script:BaselinePt = $effB.Pt
             $script:BaselineLvl = $effB.Id
+            $script:BaselineTotal = 0
         }
     }
+    # 오늘 구간 집계만 늦게 반영되는 경우가 있다 (구간 조회는 404인데 전체 국수는 이미 늘어난 상태).
+    # 판 수는 차이로 보정 - 순위 시퀀스는 서버가 따라잡은 뒤 채워진다.
+    if ($todayCount -eq 0 -and [int]$fullStats.count -gt [int]$script:BaselineTotal) {
+        $todayCount = [int]$fullStats.count - [int]$script:BaselineTotal
+    }
 
-    $today = Get-RangeStats $id $baseMs $nowPlus
-    $todayCount = 0
-    if ($today) { $todayCount = $today.count }
     if ($todayCount -ne $script:TodayCount) {
         if ($todayCount -eq 0) {
             $script:TodaySeq = @()
+            $script:TodayPts = @()
+            $script:TodayLvls = @()
             $script:TodayCount = 0
+            $script:SeqDoneMs = $null
         } else {
-            $seq = @(Get-RankSequence $id $baseMs $nowPlus 0)
+            # 순위 복원은 구간 이분 탐색이라 구간이 길수록/판이 많을수록 비싸다.
+            # 이미 복원해둔 시점 뒤쪽만 조회해 이어 붙이고, 개수가 안 맞을 때만 전체를 다시 훑는다.
+            $seq = $null
+            $addN = $todayCount - $script:TodayCount
+            if ($script:SeqDoneMs -and $script:TodayCount -gt 0 -and $addN -gt 0) {
+                $add = @(Get-RankSequence $id ([long]$script:SeqDoneMs) $nowPlus 0)
+                if ($add.Count -eq $addN) {
+                    $seq = @(@(0..($script:TodayCount - 1) | ForEach-Object {
+                        @{ Rank = $script:TodaySeq[$_]; Pt = $script:TodayPts[$_]; Lvl = $script:TodayLvls[$_] }
+                    }) + $add)
+                }
+            }
+            if ($null -eq $seq) { $seq = @(Get-RankSequence $id $baseMs $nowPlus 0) }
             # 복원된 순위 개수가 실제 판 수와 일치할 때만 반영 (중간 조회 실패 시 다음 갱신 때 재시도)
             if ($seq.Count -eq $todayCount) {
                 $script:TodaySeq = @($seq | ForEach-Object { $_.Rank })
                 $script:TodayPts = @($seq | ForEach-Object { $_.Pt })
                 $script:TodayLvls = @($seq | ForEach-Object { $_.Lvl })
                 $script:TodayCount = $todayCount
+                $script:SeqDoneMs = $queryMs
             }
         }
     }
@@ -695,12 +763,15 @@ function Get-OverlayData {
     }
     $script:CurLvlId = $curLvl
     $rank = Get-RankLine -LvlId $curLvl -Cur $curPt -BasePt $displayBase
-    $stable = Get-StableLevel $stats
+    $stable = $null
+    if (-not $emptyBasis) { $stable = Get-StableLevel $stats }
     $suffix = ''
     $myColorVal = $null
     if ($stable) {
         $suffix = '  안정 ' + $stable.Text + ' (' + (Get-BasisLabel $script:Settings.MyBasis) + ' 기준 · ' + $stats.count + '국)'
         $myColorVal = $stable.Val
+    } elseif ($emptyBasis) {
+        $suffix = '  ' + (Get-BasisLabel $script:Settings.MyBasis) + ' 기준 · 0국'
     }
     $myBadges = Get-StyleBadges $fullStats $ext
 
@@ -747,7 +818,7 @@ function Get-OverlayData {
         StartPt  = $script:BaselinePt
         CurPt    = $curPt
         GoalLine = $goalLine
-        GameLine = '전적 오늘 0국'
+        GameLine = ('전적 {0} {1}국' -f (Get-BasisLabel 'base'), $todayCount)
         StatParts = (Get-StatParts $stats $ext)
         RankMajor = (([int][math]::Floor($curLvl / 100)) % 100)
         IsOpp = $false
@@ -761,11 +832,17 @@ function Get-OpponentData {
     $oppBasis = [string]$script:Settings.OppBasis
     $statStart = Get-BasisStart $Id $nowPlus $oppBasis -Iters 11
     $stats = Get-RangeStats $Id $statStart $nowPlus
+    # 기준 구간에 판이 없으면 API가 404 - 오래 쉰 상대라도 전체 기준으로는 보여준다
+    $finalBasis = $oppBasis
+    if (-not $stats) {
+        $finalBasis = 'all'
+        $statStart = [long]$EpochStart
+        $stats = Get-RangeStats $Id $EpochStart $nowPlus
+    }
     if (-not $stats) { return $null }
     # 최소 표본 확보: 기간 내 국수가 부족하면 더 긴 기간으로 순차 확장
-    $finalBasis = $oppBasis
     $minN = [int]$script:Settings.OppMinN
-    if ($minN -gt 0 -and $oppBasis -match '^(m1|m3|m6|y1)$') {
+    if ($minN -gt 0 -and $finalBasis -eq $oppBasis -and $oppBasis -match '^(m1|m3|m6|y1)$') {
         $ladder = @('m1', 'm3', 'm6', 'y1', 'all')
         $li = [Array]::IndexOf($ladder, $oppBasis)
         while ([int]$stats.count -lt $minN -and $li -lt $ladder.Count - 1) {
@@ -832,6 +909,14 @@ try {
         $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
         $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
     $script:OcrOk = ([Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages.Count -gt 0)
+} catch {}
+
+# 물리 픽셀 <-> WPF 좌표(DIP) 환산 배율. 창 위치 계산 전에 정해져 있어야 한다
+$script:DpiScale = 1.0
+try {
+    $gDpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+    $script:DpiScale = $gDpi.DpiX / 96.0
+    $gDpi.Dispose()
 } catch {}
 
 function Await($WinRtTask, $ResultType) {
@@ -903,46 +988,171 @@ function Invoke-OcrBitmap {
     return $tokens
 }
 
+# ---------------- 게임 창 위치 ----------------
+# 모든 좌표 계산의 기준. 창모드·보조 모니터·모니터 걸침·다른 해상도를 지원하기 위해
+# '주 모니터 전체'가 아니라 '게임 창의 16:9 화면 영역'을 기준으로 삼는다.
+$script:GameTitleWords = @('작혼', '雀魂', 'Mahjong Soul', 'MahjongSoul', 'Majsoul', '雀魂麻将', '雀魂麻將')
+$script:GameProcNames = @('Jantama_MahjongSoul', 'majsoul')
+
+function Find-GameWindow {
+    # 콜백 안에서 쓰는 값은 전부 script 스코프로 - 델리게이트 호출마다 스코프가 새로 생겨 지역 변수는 유지되지 않는다
+    $script:FoundWin = [IntPtr]::Zero
+    $script:FoundArea = 0.0
+    $script:FindNames = @($script:GameProcNames)
+    if ($script:GameProcName) { $script:FindNames = @([string]$script:GameProcName) + $script:FindNames }
+    $cb = [Native+EnumProc] {
+        param($h, $p)
+        try {
+            if (-not [Native]::IsWindowVisible($h) -or [Native]::IsIconic($h)) { return $true }
+            $cr = New-Object Native+RECT
+            if (-not [Native]::GetClientRect($h, [ref]$cr)) { return $true }
+            if ($cr.R -lt 400 -or $cr.B -lt 300) { return $true }
+            $area = [double]$cr.R * [double]$cr.B
+            if ($area -le $script:FoundArea) { return $true }
+            $hit = $false
+            $procId = 0
+            $null = [Native]::GetWindowThreadProcessId($h, [ref]$procId)
+            try {
+                $pn = (Get-Process -Id $procId -ErrorAction Stop).ProcessName
+                foreach ($n in $script:FindNames) { if ($n -and $pn -like "*$n*") { $hit = $true; break } }
+            } catch {}
+            if (-not $hit) {
+                $sb = New-Object Text.StringBuilder 512
+                $null = [Native]::GetWindowTextW($h, $sb, 512)
+                $t = $sb.ToString()
+                if ($t) { foreach ($k in $script:GameTitleWords) { if ($t -like "*$k*") { $hit = $true; break } } }
+            }
+            if ($hit) { $script:FoundWin = $h; $script:FoundArea = $area }
+        } catch {}
+        return $true
+    }
+    $null = [Native]::EnumWindows($cb, [IntPtr]::Zero)
+    return $script:FoundWin
+}
+
+# 게임 화면은 항상 16:9로 그려진다 - 창 비율이 다르면 위아래(레터박스)/좌우(필러박스) 여백을 잘라낸다
+function ConvertTo-ContentRect {
+    param($R)
+    $target = 16.0 / 9.0
+    if ([double]$R.H -le 0) { return $R }
+    $ar = [double]$R.W / [double]$R.H
+    if ($ar -gt $target + 0.01) {
+        $nw = [int]([double]$R.H * $target)
+        $R.X += [int](([double]$R.W - $nw) / 2); $R.W = $nw
+    } elseif ($ar -lt $target - 0.01) {
+        $nh = [int]([double]$R.W / $target)
+        $R.Y += [int](([double]$R.H - $nh) / 2); $R.H = $nh
+    }
+    return $R
+}
+
+# 게임 화면 영역(물리 픽셀, 가상 데스크톱 좌표). 창을 못 찾으면 주 모니터 전체로 대체.
+function Get-GameRect {
+    param([switch]$Fresh)
+    if (-not $Fresh -and $script:GameRect -and ((Get-Date) - $script:GameRectAt).TotalMilliseconds -lt 1000) {
+        return $script:GameRect
+    }
+    $r = $null
+    try {
+        $h = Find-GameWindow
+        if ($h -ne [IntPtr]::Zero) {
+            $cr = New-Object Native+RECT
+            $pt = New-Object Native+POINT
+            if ([Native]::GetClientRect($h, [ref]$cr) -and [Native]::ClientToScreen($h, [ref]$pt)) {
+                if ($cr.R -gt 200 -and $cr.B -gt 150) {
+                    $r = @{ X = [int]$pt.X; Y = [int]$pt.Y; W = [int]$cr.R; H = [int]$cr.B }
+                }
+            }
+        }
+    } catch {}
+    if (-not $r) {
+        $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+        $r = @{ X = [int]$b.X; Y = [int]$b.Y; W = [int]$b.Width; H = [int]$b.Height }
+    }
+    $r = ConvertTo-ContentRect $r
+    $script:GameRect = $r
+    $script:GameRectAt = Get-Date
+    return $r
+}
+
+# 게임 화면 영역을 DIP(창 좌표계) 단위로
+function Get-GameRectDip {
+    $r = Get-GameRect
+    $d = [double]$script:DpiScale
+    if ($d -le 0) { $d = 1.0 }
+    return @{ X = $r.X / $d; Y = $r.Y / $d; W = $r.W / $d; H = $r.H / $d }
+}
+
 function Get-ScreenCapture {
-    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-    $bmp = New-Object Drawing.Bitmap $b.Width, $b.Height
+    $r = Get-GameRect -Fresh
+    $bmp = New-Object Drawing.Bitmap $r.W, $r.H
     $g = [Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($b.Location, [Drawing.Point]::Empty, $b.Size)
+    $g.CopyFromScreen($r.X, $r.Y, 0, 0, (New-Object Drawing.Size $r.W, $r.H))
     $g.Dispose()
+    $script:CapRect = $r
     return $bmp
 }
 
-# 전체 화면 1.6배 확대 스캔
+# 캡처 비트맵 좌표 -> 화면 절대 좌표 (게임 창이 어느 모니터에 있든 통하도록)
+function Get-CapOrigin {
+    if ($script:CapRect) { return @($script:CapRect.X, $script:CapRect.Y) }
+    return @(0, 0)
+}
+
+# 게임 화면 전체 1.6배 확대 스캔
 function Get-FullTokens {
     param($Bmp)
     $maxDim = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
     $scale = [math]::Min(1.6, [math]::Min($maxDim / $Bmp.Width, $maxDim / $Bmp.Height))
     $full = New-ResizedBitmap $Bmp $scale
+    $o = Get-CapOrigin
     $out = New-Object Collections.ArrayList
     foreach ($t in (Invoke-OcrBitmap $full)) {
-        $null = $out.Add(@{ Text = $t.Text; X = ($t.X / $scale); Y = ($t.Y / $scale); Src = 'f' })
+        $null = $out.Add(@{ Text = $t.Text; X = ($o[0] + $t.X / $scale); Y = ($o[1] + $t.Y / $scale); Src = 'f' })
     }
     $full.Dispose()
     return $out
 }
 
 # 상대 명패 정밀 스캔 - 좁은 영역을 크게 확대할수록 인식률이 크게 오름
+$script:PlateBands = @(
+    @(0.000, 0.29, 0.15, 0.12, 8.0),   # 왼쪽 이름표 (정밀)
+    @(0.66,  0.07, 0.24, 0.12, 8.0),   # 상단 이름표 (정밀)
+    @(0.85,  0.29, 0.15, 0.12, 8.0),   # 오른쪽 이름표 (정밀)
+    @(0.15,  0.74, 0.22, 0.14, 8.0),   # 하단(내 자리) 이름표 - 관전 시 4번째 플레이어 (정밀)
+    @(0.00,  0.22, 0.24, 0.28, 4.0),   # 왼쪽 (광역)
+    @(0.58,  0.03, 0.38, 0.22, 4.0),   # 상단 (광역)
+    @(0.76,  0.22, 0.24, 0.28, 4.0),   # 오른쪽 (광역)
+    @(0.10,  0.70, 0.32, 0.20, 4.0)    # 하단 (광역)
+)
+
+# 못 찾은 채로 스캔이 끝나면 OCR이 실제로 뭘 봤는지 확인할 수 있게 명패 크롭을 남긴다
+function Save-PlateCrops {
+    param($Bmp)
+    $names = @('left', 'top', 'right', 'bottom')
+    for ($i = 0; $i -lt 4; $i++) {
+        $bd = $script:PlateBands[$i]
+        try {
+            $rx = [int]($Bmp.Width * $bd[0]); $ry = [int]($Bmp.Height * $bd[1])
+            $rw = [int]($Bmp.Width * $bd[2]); $rh = [int]($Bmp.Height * $bd[3])
+            if ($rx + $rw -gt $Bmp.Width) { $rw = $Bmp.Width - $rx }
+            if ($ry + $rh -gt $Bmp.Height) { $rh = $Bmp.Height - $ry }
+            if ($rw -le 0 -or $rh -le 0) { continue }
+            $crop = $Bmp.Clone((New-Object Drawing.Rectangle $rx, $ry, $rw, $rh), $Bmp.PixelFormat)
+            $crop.Save((Join-Path $PSScriptRoot "scan-plate-$($names[$i]).png"), [Drawing.Imaging.ImageFormat]::Png)
+            $crop.Dispose()
+        } catch {}
+    }
+}
+
 function Get-PlateTokens {
     param($Bmp, [int]$Pass = 0)
     $out = New-Object Collections.ArrayList
     # @(x, y, w, h, 확대배율) - 이름표 주변만 좁게 자른 고배율 + 여유 있는 저배율(위치 오차 대비)
-    $bands = @(
-        @(0.000, 0.29, 0.15, 0.12, 8.0),   # 왼쪽 이름표 (정밀)
-        @(0.66,  0.07, 0.24, 0.12, 8.0),   # 상단 이름표 (정밀)
-        @(0.85,  0.29, 0.15, 0.12, 8.0),   # 오른쪽 이름표 (정밀)
-        @(0.15,  0.74, 0.22, 0.14, 8.0),   # 하단(내 자리) 이름표 - 관전 시 4번째 플레이어 (정밀)
-        @(0.00,  0.22, 0.24, 0.28, 4.0),   # 왼쪽 (광역)
-        @(0.58,  0.03, 0.38, 0.22, 4.0),   # 상단 (광역)
-        @(0.76,  0.22, 0.24, 0.28, 4.0),   # 오른쪽 (광역)
-        @(0.10,  0.70, 0.32, 0.20, 4.0)    # 하단 (광역)
-    )
+    $bands = $script:PlateBands
     # 1차 시도는 정밀(고배율) 밴드만 - 빠르게. 이후 시도에서 광역 밴드까지 확장
     if ($Pass -eq 0) { $bands = @($bands | Where-Object { [double]$_[4] -ge 6.0 }) }
+    $o = Get-CapOrigin
     foreach ($bd in $bands) {
         $rx = [int]($Bmp.Width * $bd[0]); $ry = [int]($Bmp.Height * $bd[1])
         $rw = [int]($Bmp.Width * $bd[2]); $rh = [int]($Bmp.Height * $bd[3])
@@ -960,7 +1170,7 @@ function Get-PlateTokens {
             $big = New-ResizedBitmap $crop $z
             $crop.Dispose()
             foreach ($t in (Invoke-OcrBitmap $big)) {
-                $null = $out.Add(@{ Text = $t.Text; X = ($rx + $t.X / $z); Y = ($ry + $t.Y / $z); Src = 'p' })
+                $null = $out.Add(@{ Text = $t.Text; X = ($o[0] + $rx + $t.X / $z); Y = ($o[1] + $ry + $t.Y / $z); Src = 'p' })
             }
             $big.Dispose()
         } catch {}
@@ -1146,26 +1356,56 @@ function Get-StrSimilarity {
     return (1.0 - ($dist / $mx))
 }
 
-# 앞 2글자를 접두사로 검색해 가장 비슷한 실존 닉을 찾음 (OCR이 뒷부분을 뭉갠 경우 구제)
+# 유사도 비교 전 정규화: OCR이 서로 자주 바꿔 읽는 점·따옴표류(丶 ` ' 、 ・ …)를 한 글자로 통일
+$script:DotChars = @([char]0x0060, [char]0x0027, [char]0x00B4, [char]0x2018, [char]0x2019, [char]0x02BB,
+                     [char]0x02BC, [char]0x00B7, [char]0x2022, [char]0x30FB, [char]0x3001, [char]0x3002,
+                     [char]0x30FD, [char]0x309D, [char]0x4E36, [char]0xFF0C, [char]0xFF61, [char]0xFF64)
+function Get-NickCanon {
+    param([string]$S)
+    if (-not $S) { return '' }
+    $sb = New-Object Text.StringBuilder
+    foreach ($ch in $S.ToCharArray()) {
+        if ($script:DotChars -contains $ch) { $null = $sb.Append([char]0x4E36) } else { $null = $sb.Append($ch) }
+    }
+    return $sb.ToString()
+}
+
+# 접두사로 검색해 가장 비슷한 실존 닉을 찾음 (OCR이 뒷부분을 뭉갠 경우 구제)
+# 앞 2글자 → 실패하면 첫 글자만 (2번째 글자까지 오인식된 경우 구제: 韶隼` → 韶 → 韶华丶)
 function Find-ByPrefix {
     param([string]$Raw)
     if ($Raw.Length -lt 3 -or $Raw.Length -gt 16) { return $false }
-    $pre = $Raw.Substring(0, 2)
-    if ($pre -notmatch '^[぀-ヿ一-鿿]{2}$') {
-        # 2번째 글자가 비CJK(오인식 기호 등)면 첫 글자만으로 검색 (貞~照 → 貞)
-        if ($Raw.Substring(0, 1) -match '^[぀-ヿ一-鿿]$') { $pre = $Raw.Substring(0, 1) }
-        else { return $false }
+    if ($Raw.Substring(0, 1) -notmatch '^[぀-ヿ一-鿿]$') { return $false }
+    $pres = New-Object Collections.ArrayList
+    if ($Raw.Substring(0, 2) -match '^[぀-ヿ一-鿿]{2}$') { $null = $pres.Add($Raw.Substring(0, 2)) }
+    $null = $pres.Add($Raw.Substring(0, 1))
+    foreach ($pre in $pres) {
+        $id = Find-ByPrefixOne $Raw $pre
+        if ($id) { return $id }
     }
-    $ck = "pre:$pre"
+    return $false
+}
+
+function Find-ByPrefixOne {
+    param([string]$Raw, [string]$Pre)
+    $ck = "pre:$Pre"
     if (-not $script:NickCache.ContainsKey($ck)) {
         if ($script:ScanQueryLeft -le 0) { return $false }
         $script:ScanQueryLeft--
         try {
             Start-Sleep -Milliseconds 100
-            $script:NickCache[$ck] = @(Invoke-RestMethod -Uri "$Api/search_player/$([uri]::EscapeDataString($pre))?limit=100" -TimeoutSec 10)
+            $res = Invoke-RestMethod -Uri "$Api/search_player/$([uri]::EscapeDataString($Pre))?limit=100" -TimeoutSec 10
+            # Invoke-RestMethod는 JSON 배열을 '한 덩어리'로 넘겨서 @()로 감싸면 중첩됨 - 한 겹 풀어줌
+            $flat = New-Object Collections.ArrayList
+            foreach ($x in @($res)) {
+                if ($x -is [array]) { foreach ($y in $x) { $null = $flat.Add($y) } }
+                elseif ($null -ne $x) { $null = $flat.Add($x) }
+            }
+            $script:NickCache[$ck] = @($flat.ToArray())
         } catch { return $false }
     }
     $cands = @($script:NickCache[$ck])
+    $rawC = Get-NickCanon $Raw
     $cutoff = [DateTimeOffset]::UtcNow.AddDays(-60).ToUnixTimeMilliseconds()
     $best = $null; $bestS = 0.0; $secondS = 0.0
     foreach ($c in $cands) {
@@ -1175,13 +1415,13 @@ function Find-ByPrefix {
         $ts = $c.latest_timestamp -as [long]
         if ($null -eq $ts -or ($ts * 1000) -le $cutoff) { continue }
         if ([math]::Abs($nick.Length - $Raw.Length) -gt 2) { continue }
-        $sim = Get-StrSimilarity $Raw $nick
+        $sim = Get-StrSimilarity $rawC (Get-NickCanon $nick)
         if ($sim -gt $bestS) { $secondS = $bestS; $bestS = $sim; $best = $c }
         elseif ($sim -gt $secondS) { $secondS = $sim }
     }
     # 충분히 비슷하고, 2등과 확실히 차이날 때만 채택
     if ($best -and $bestS -ge 0.55 -and ($bestS - $secondS) -ge 0.08) {
-        $null = $script:ScanLog.Add(">>> 유사매칭: $Raw -> $($best.nickname) ({0:N2})" -f $bestS)
+        $null = $script:ScanLog.Add((">>> 유사매칭: $Raw -> $($best.nickname) ({0:N2})" -f $bestS))
         return $best.id
     }
     return $false
@@ -1194,8 +1434,10 @@ function Test-NickPlausible {
     if ($T -imatch '^([a-z0-9])+$') { return $false }
     # 한글 + 라틴/숫자 혼합은 대부분 OCR 잡음
     if ($T -match '[가-힣]' -and $T -match '[A-Za-z0-9]') { return $false }
-    # 숫자·기호 비중이 과반이면 잡음
-    $bad = ([regex]::Matches($T, '[\d.,:%/()\-_|~`]')).Count
+    # 숫자·기호 비중이 과반이면 잡음 (단 물결표는 일본어 닉에 흔해서 가나·한자 토큰에선 세지 않음)
+    $noise = '[\d.,:%/()\-_|~`]'
+    if ($T -match '[぀-ヿ一-鿿]') { $noise = '[\d.,:%/()\-_|`]' }
+    $bad = ([regex]::Matches($T, $noise)).Count
     if ($bad * 2 -gt $T.Length) { return $false }
     return $true
 }
@@ -1210,7 +1452,7 @@ function Resolve-Tokens {
     param($Tokens, $FoundMap, [bool]$NoCenter = $false)
     $myNick = $script:Nickname
     $seen = @{}
-    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $b = Get-GameRect   # 토큰 좌표는 화면 절대 좌표 - 비율 판정은 게임 화면 영역 기준으로
 
     # 1) 후보 정리 - 중복 제거 (중앙 필터는 순위 화면 감지 후 적용)
     $cands = New-Object Collections.ArrayList
@@ -1234,29 +1476,30 @@ function Resolve-Tokens {
         }
         if ($dedup.ContainsKey($raw)) { continue }
         $dedup[$raw] = $true
-        $null = $cands.Add(@{ Raw = $raw; X = $tk.X; Y = $tk.Y; Src = [string]$tk.Src; Rk = $rk })
+        $null = $cands.Add(@{ Raw = $raw; X = $tk.X; Y = $tk.Y; Src = [string]$tk.Src; Rk = $rk; Ix = $cands.Count })
     }
 
     # 순위 화면('N위' 마커)이 아니면 중앙(패산) 토큰 제외
     if (-not $NoCenter -and -not $hasRank) {
         $cands = @($cands | Where-Object {
-            -not ($_.X -gt $b.Width * 0.30 -and $_.X -lt $b.Width * 0.70 -and
-                  $_.Y -gt $b.Height * 0.28 -and $_.Y -lt $b.Height * 0.72)
+            -not ($_.X -gt $b.X + $b.W * 0.30 -and $_.X -lt $b.X + $b.W * 0.70 -and
+                  $_.Y -gt $b.Y + $b.H * 0.28 -and $_.Y -lt $b.Y + $b.H * 0.72)
         })
     }
     # 순위 화면이면: 화면 맨 위의 순위 묶음(열린 팝업/결과)만 취급 - 뒤에 비치는 다른 판 목록 배제
     if ($hasRank) {
         $minY = [double]::MaxValue
         foreach ($cd in $cands) { if ($cd.Rk -and [double]$cd.Y -lt $minY) { $minY = [double]$cd.Y } }
-        $cands = @($cands | Where-Object { $_.Rk -and ([double]$_.Y - $minY) -lt ($b.Height * 0.18) })
+        $cands = @($cands | Where-Object { $_.Rk -and ([double]$_.Y - $minY) -lt ($b.H * 0.18) })
     }
 
     # 2) 우선순위: 순위 화면이면 'N위' 붙은 이름을 화면 위쪽(열린 팝업)부터,
     #    아니면 명패 토큰 → 긴 토큰 (조회 예산을 값어치 있는 곳에)
+    #    Sort-Object는 동순위 순서를 보장하지 않으므로 마지막에 원래 OCR 순서(Ix)로 고정
     if ($hasRank) {
-        $ordered = @($cands | Sort-Object @{ Expression = { if ($_.Rk) { 0 } else { 1 } } }, @{ Expression = { $_.Y } }, @{ Expression = { -($_.Raw.Length) } })
+        $ordered = @($cands | Sort-Object @{ Expression = { if ($_.Rk) { 0 } else { 1 } } }, @{ Expression = { $_.Y } }, @{ Expression = { -($_.Raw.Length) } }, @{ Expression = { $_.Ix } })
     } else {
-        $ordered = @($cands | Sort-Object @{ Expression = { if ($_.Src -eq 'p') { 0 } else { 1 } } }, @{ Expression = { -($_.Raw.Length) } })
+        $ordered = @($cands | Sort-Object @{ Expression = { if ($_.Src -eq 'p') { 0 } else { 1 } } }, @{ Expression = { -($_.Raw.Length) } }, @{ Expression = { $_.Ix } })
     }
 
     foreach ($phase in 0, 1) {
@@ -1272,7 +1515,8 @@ function Resolve-Tokens {
                 break
             }
         }
-        if ($null -ne $preNear -and $raw.Length -le ([string]$FoundMap[$preNear].Nick).Length) { continue }
+        # (유사매칭으로 잡힌 자리는 정확 일치가 뒤집을 수 있어야 하므로 건너뛰지 않음)
+        if ($null -ne $preNear -and -not $FoundMap[$preNear].Fz -and $raw.Length -le ([string]$FoundMap[$preNear].Nick).Length) { continue }
         # 정원이 찼는데 교체 후보(근처)도 아니면 종료 대상
         if ($FoundMap.Count -ge 4 -and $null -eq $preNear) { continue }
 
@@ -1337,13 +1581,14 @@ function Resolve-Tokens {
                     }
                     if ($null -eq $nearKey) {
                         if ($FoundMap.Count -lt 4) {
-                            $FoundMap[$key] = @{ Id = $id; Nick = $t; X = $tk.X; Y = $tk.Y }
+                            $FoundMap[$key] = @{ Id = $id; Nick = $t; X = $tk.X; Y = $tk.Y; Fz = $false }
                             $null = $script:ScanLog.Add(">>> 매칭: $t (id $id)")
                             Notify-NewFound $FoundMap
                         }
-                    } elseif ($t.Length -gt ([string]$FoundMap[$nearKey].Nick).Length) {
+                    } elseif ([bool]$FoundMap[$nearKey].Fz -or $t.Length -gt ([string]$FoundMap[$nearKey].Nick).Length) {
+                        # 정확 일치는 유사매칭을 항상 이김, 그 외에는 더 긴(완전한) 닉이 승리
                         $FoundMap.Remove($nearKey)
-                        $FoundMap[$key] = @{ Id = $id; Nick = $t; X = $tk.X; Y = $tk.Y }
+                        $FoundMap[$key] = @{ Id = $id; Nick = $t; X = $tk.X; Y = $tk.Y; Fz = $false }
                         $null = $script:ScanLog.Add(">>> 근접 교체: $t (id $id)")
                         Notify-NewFound $FoundMap
                     } else {
@@ -1365,7 +1610,8 @@ function Resolve-Tokens {
                 if ($fid) {
                     $fkey = "$fid"
                     if (-not $FoundMap.ContainsKey($fkey)) {
-                        $FoundMap[$fkey] = @{ Id = $fid; Nick = $raw; X = $tk.X; Y = $tk.Y }
+                        # Fz: 유사매칭 자리 표시 - 나중에 정확 일치가 나오면 교체됨
+                        $FoundMap[$fkey] = @{ Id = $fid; Nick = $raw; X = $tk.X; Y = $tk.Y; Fz = $true }
                         Notify-NewFound $FoundMap
                     }
                 }
@@ -1446,6 +1692,10 @@ function Scan-Opponents {
         } catch {
             $null = $script:ScanLog.Add("오류: $($_.Exception.Message)")
         }
+        # 아직 못 찾은 자리가 있으면 OCR이 실제로 본 명패 이미지를 남긴다 (scan-plate-*.png, 매번 덮어씀)
+        $tgt = 4
+        if ($script:SawMyNick) { $tgt = 3 }
+        if ($bmp -and $try -ge 2 -and $found.Count -lt $tgt) { Save-PlateCrops $bmp }
         if ($bmp) { $bmp.Dispose() }
         # 중간에 강제 종료돼도 과정을 볼 수 있게 시도마다 기록
         try { ($script:ScanLog -join "`r`n") | Out-File (Join-Path $PSScriptRoot 'scan-log.txt') -Encoding utf8 } catch {}
@@ -1458,6 +1708,34 @@ function Scan-Opponents {
 
 # ---------------- 테스트 모드 ----------------
 
+# 내부 테스트: 게임 창을 어떻게 인식하고 있는지 확인 (창모드/보조 모니터 문제 진단용)
+if ($args -contains '-TestRect') {
+    # -TestRect X Y W H : 가상의 창 크기로 16:9 보정만 확인
+    if ($args.Count -ge 5) {
+        $c = ConvertTo-ContentRect @{ X = [int]$args[1]; Y = [int]$args[2]; W = [int]$args[3]; H = [int]$args[4] }
+        '({0},{1}) {2}x{3}  ->  ({4},{5}) {6}x{7}  (비 {8:N3})' -f $args[1], $args[2], $args[3], $args[4], $c.X, $c.Y, $c.W, $c.H, ([double]$c.W / [double]$c.H)
+        exit 0
+    }
+    $hw = Find-GameWindow
+    $r = Get-GameRect -Fresh
+    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    [pscustomobject]@{
+        게임창찾음 = ($hw -ne [IntPtr]::Zero)
+        게임화면 = ('({0},{1}) {2}x{3}' -f $r.X, $r.Y, $r.W, $r.H)
+        화면비 = ('{0:N3}' -f ([double]$r.W / [double]$r.H))
+        주모니터 = ('({0},{1}) {2}x{3}' -f $b.X, $b.Y, $b.Width, $b.Height)
+        DpiScale = $script:DpiScale
+    } | Format-List
+    # 실제로 그 영역을 캡처해 명패 크롭까지 저장 - 눈으로 확인 가능
+    try {
+        $bmp = Get-ScreenCapture
+        Save-PlateCrops $bmp
+        "캡처 {0}x{1} - scan-plate-left/top/right/bottom.png 저장됨" -f $bmp.Width, $bmp.Height
+        $bmp.Dispose()
+    } catch { "캡처 실패: $($_.Exception.Message)" }
+    exit 0
+}
+
 # 내부 테스트: 토큰 시나리오(JSON)를 실제 매칭 파이프라인에 통과시켜 결과 출력
 if ($args.Count -ge 2 -and $args[0] -eq '-TestResolve') {
     $sc = Get-Content ([string]$args[1]) -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -1467,10 +1745,10 @@ if ($args.Count -ge 2 -and $args[0] -eq '-TestResolve') {
     $script:SkipRects = @()
     $script:ScanOnProgress = $null
     $script:ScanLog = New-Object Collections.ArrayList
-    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $b = Get-GameRect   # 시나리오의 X/Y는 게임 화면 비율 - 절대 좌표로 변환
     $tokens = New-Object Collections.ArrayList
     foreach ($t in $sc.Tokens) {
-        $null = $tokens.Add(@{ Text = [string]$t.T; X = [double]$t.X * $b.Width; Y = [double]$t.Y * $b.Height; Src = [string]$t.S })
+        $null = $tokens.Add(@{ Text = [string]$t.T; X = ($b.X + [double]$t.X * $b.W); Y = ($b.Y + [double]$t.Y * $b.H); Src = [string]$t.S })
     }
     $found = @{}
     Resolve-Tokens $tokens $found ([bool]$sc.NoCenter)
@@ -1589,13 +1867,6 @@ if ($gpIdx -ge 0 -and ($gpIdx + 1) -lt $args.Count) { $GameProcName = [string]$a
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:DpiScale = 1.0
-try {
-    $g = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
-    $script:DpiScale = $g.DpiX / 96.0
-    $g.Dispose()
-} catch {}
-
 $BoxXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -1709,6 +1980,11 @@ $BoxXaml = @'
             <TextBlock x:Name="TbScaleL" Text="박스 크기 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100" ToolTip="박스 위에서 Ctrl+마우스휠로도 조절" ToolTipService.InitialShowDelay="0"/>
             <ComboBox x:Name="CmbScale" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
           </StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
+            <TextBlock x:Name="TbPosL" Text="박스 위치 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
+            <TextBlock x:Name="BtnPosReset" Text="내 프로필 위로 되돌리기" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E"
+                       VerticalAlignment="Center" Cursor="Hand" TextDecorations="Underline" Opacity="0.85"/>
+          </StackPanel>
           <TextBlock x:Name="TbSrcL" Text="── 전적 검색 사이트 / 자료 출처 ──" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.7" Margin="0,7,0,2"/>
           <TextBlock x:Name="LnkSource" Text="https://amae-koromo.sapk.ch/" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.85"
                      TextDecorations="Underline" Cursor="Hand" Margin="0,0,0,1" ToolTip="브라우저로 열기" ToolTipService.InitialShowDelay="0"/>
@@ -1749,6 +2025,17 @@ function Update-HelpTexts {
             $b.BtnHelp.ToolTip = Get-HelpText
             $b.TbHelp.Text = Get-HelpText
         }
+    }
+}
+
+# 기준 시점 설정(오늘 0시 / 실행 시점)에 따라 문구가 달라지는 라벨 갱신
+function Update-BasisLabels {
+    $lbl = Get-BasisLabel 'base'
+    foreach ($b in Get-AllBoxes) {
+        if ($b -and $b.TbGoalL) { $b.TbGoalL.Text = "$lbl 목표 pt " }
+    }
+    if ($script:MyBox -and $script:MyBox.DispPanel -and $script:MyBox.DispPanel.Visibility -eq 'Visible') {
+        Build-DispPanel $script:MyBox
     }
 }
 
@@ -1924,6 +2211,8 @@ function New-StatWindow {
         CmbMinN = $w.FindName('CmbMinN')
         TbScaleL = $w.FindName('TbScaleL')
         CmbScale = $w.FindName('CmbScale')
+        TbPosL = $w.FindName('TbPosL')
+        BtnPosReset = $w.FindName('BtnPosReset')
         TbShowL = $w.FindName('TbShowL')
         DispPanel = $w.FindName('DispPanel')
         TbNickL = $w.FindName('TbNickL')
@@ -2197,10 +2486,23 @@ function New-StatWindow {
         $script:TodayLvls = @()
         $script:BaselinePt = $null
         $script:BaselineLvl = $null
+        $script:BaselineTotal = $null
+        $script:BaseCheckedAt = $null
+        $script:SeqDoneMs = $null
         $script:AnnouncedCount = -1
+        $script:GoalCelebrated = $null
+        Update-BasisLabels
         Save-Pos
         Update-Overlay
     })
+    # 박스 위치 기본값(내 프로필 위)으로 되돌리기
+    if ($box.BtnPosReset) {
+        $box.BtnPosReset.Add_MouseLeftButtonDown({
+            $args[1].Handled = $true
+            Set-MyBoxDefaultPos
+            Save-Pos
+        })
+    }
     # 박스 크기 변경
     $box.CmbScale.Add_SelectionChanged({
         if ($script:SyncingUI) { return }
@@ -2254,6 +2556,7 @@ function Apply-Theme {
                       $Box.CbToast, $Box.CbMortal, $Box.CbAnom,
                       $Box.TbBasisMyL, $Box.TbBasisOppL, $Box.TbBasisWarn, $Box.BtnRefresh,
                       $Box.TbKeyScanL, $Box.TbKeyCloseL, $Box.TbKeyExitL, $Box.TbGoalL, $Box.TbBaseL, $Box.TbMinNL, $Box.TbScaleL, $Box.TbShowL, $Box.TbNickL, $Box.BtnNickApply,
+                      $Box.TbPosL, $Box.BtnPosReset,
                       $Box.TbSetupL, $Box.BtnSetupApply, $Box.TbAnomModeL, $Box.TbAnomHighL, $Box.TbAnomLowL, $Box.TbAnomPctL, $Box.BtnAdv, $Box.CbBadge, $Box.BtnBadgeAdv,
                       $Box.TbShowL, $Box.TbSrcL, $Box.LnkSource)) {
         if ($tb) { $tb.Foreground = New-Brush $fg }
@@ -2286,7 +2589,8 @@ function Switch-Theme {
 
 function Save-Pos {
     $script:Settings.Nickname = $script:Nickname   # 닉네임은 항상 설정 파일에 보존 (백그라운드 프로세스가 읽음)
-    @{ Left = $script:MyBox.Win.Left; Top = $script:MyBox.Win.Top; Theme = $script:Theme; Settings = $script:Settings } |
+    @{ Left = $script:MyBox.Win.Left; Top = $script:MyBox.Win.Top; PosVer = $script:PosVer
+       Theme = $script:Theme; Settings = $script:Settings } |
         ConvertTo-Json | Out-File $script:PosFile -Encoding utf8
 }
 
@@ -2300,7 +2604,8 @@ function Apply-Nickname {
     $script:CachedId = 0
     $script:ExtCache = $null
     $script:BasisCache = @{}
-    $script:TodayDate = $null    # 다음 갱신 때 오늘 상태 전체 리셋
+    $script:TodayDate = $null
+    $script:ForceReset = $true   # 다음 갱신 때 오늘 상태 전체 리셋 (기준 시점 설정과 무관하게)
     $script:LastShownPt = $null
     $script:LastData = $null
     $script:Settings.Nickname = $NewNick
@@ -2405,8 +2710,8 @@ $script:DispItems = @(
     @{ K = 'Tobi'; N = '토비율' }, @{ K = 'Wt'; N = '평균화료순' }, @{ K = 'Stat4'; N = '우형리치·선제리치율' },
     @{ K = 'Stable'; N = '안정단위' }, @{ K = 'Badge'; N = '스타일 배지' },
     @{ K = 'NameColor'; N = '닉네임 강함 색상' },
-    @{ K = 'SeqColor'; N = '오늘 순위 색상'; Me = $true }, @{ K = 'Streak'; N = '연대/라스 스트릭'; Me = $true },
-    @{ K = 'Spark'; N = '오늘 pt 그래프'; Me = $true }
+    @{ K = 'SeqColor'; N = '{기준} 순위 색상'; Me = $true }, @{ K = 'Streak'; N = '연대/라스 스트릭'; Me = $true },
+    @{ K = 'Spark'; N = '{기준} pt 그래프'; Me = $true }
 )
 $script:DispTarget = 'me'
 
@@ -2518,7 +2823,8 @@ function Build-DispPanel {
         # 내 박스에만 존재하는 데이터 항목은 상대 탭에서 숨김
         if ($isOpp -and $it.Me) { continue }
         $cb = New-Object Windows.Controls.CheckBox
-        $cb.Content = [string]$it.N
+        # '{기준}'은 기준 시점 설정에 따라 '오늘' / '실행 후'로 바뀐다
+        $cb.Content = ([string]$it.N) -replace '\{기준\}', (Get-BasisLabel 'base')
         $cb.FontFamily = New-Object Windows.Media.FontFamily 'Malgun Gothic'
         $cb.FontSize = 12.5
         $cb.FontWeight = [Windows.FontWeights]::Bold
@@ -4249,12 +4555,31 @@ $my = New-StatWindow $BoxXaml
 $win = $my.Win
 $script:MyBox = $my
 
+# 기본 위치 규칙이 바뀌면 올린다 - 저장된 위치가 이보다 낮으면 한 번만 새 기본값으로 재배치
+$script:PosVer = 2
+
+# 내 박스 기본 위치: 내 프로필(하단 왼쪽 아바타) 바로 위 - 패나 명패를 가리지 않는 자리
+function Set-MyBoxDefaultPos {
+    $w = $script:MyBox.Win
+    $w.UpdateLayout()
+    $h = [double]$w.ActualHeight
+    if ($h -le 0) { $h = 200 }
+    $g = Get-GameRectDip
+    $w.Left = $g.X + $g.W * 0.142
+    $w.Top = $g.Y + $g.H * 0.655 - $h
+}
+
 $posFile = Join-Path $PSScriptRoot 'overlay-pos.json'
 $script:PosFile = $posFile
+$script:HasSavedPos = $false
 if (Test-Path $posFile) {
     try {
         $pos = Get-Content $posFile -Raw | ConvertFrom-Json
-        $win.Left = $pos.Left; $win.Top = $pos.Top
+        # 기본 위치 규칙이 바뀌었으면(PosVer가 낮으면) 저장된 위치를 버리고 새 기본값으로 한 번 재배치
+        if ($null -ne $pos.Left -and $null -ne $pos.Top -and ([int]$pos.PosVer) -ge $script:PosVer) {
+            $win.Left = $pos.Left; $win.Top = $pos.Top
+            $script:HasSavedPos = $true
+        }
         if ($pos.Theme -and @('light', 'dark', 'trans') -contains $pos.Theme) { $script:Theme = $pos.Theme }
         if ($pos.Settings) {
             foreach ($k in @('Stable', 'Danger', 'RankColors', 'Streak', 'Spark', 'Toast', 'MortalWatch', 'ShowTobi', 'Anom', 'BadgeOn',
@@ -4292,6 +4617,11 @@ if (Test-Path $posFile) {
 Apply-Theme $my
 Apply-Scale $my
 Update-HelpTexts
+Update-BasisLabels
+if (-not $script:HasSavedPos) {
+    Set-MyBoxDefaultPos
+    $script:NeedDefaultPos = $true   # 내용이 채워져 실제 높이가 나오면 한 번 더 맞춘다
+}
 # 닉네임 미설정 상태면 박스에 입력칸 표시
 if (-not $script:Nickname -or $script:Nickname -eq '여기에닉네임') {
     $my.SetupPanel.Visibility = 'Visible'
@@ -4304,6 +4634,7 @@ function Update-Overlay {
         $d = Get-OverlayData
         $script:LastData = $d
         Set-StatWindow $my $d
+        if ($script:NeedDefaultPos) { $script:NeedDefaultPos = $false; Set-MyBoxDefaultPos; Save-Pos }
         # 새 판이 반영되면 토스트 알림
         if ($script:Settings.Toast -and $script:AnnouncedCount -ge 0 -and $script:TodayCount -gt $script:AnnouncedCount -and @($script:TodaySeq).Count -gt 0) {
             $lastRank = $script:TodaySeq[$script:TodaySeq.Count - 1]
@@ -4321,11 +4652,12 @@ function Update-Overlay {
         }
         if ($script:TodayCount -ge 0) { $script:AnnouncedCount = $script:TodayCount }
         if ($null -ne $d.CurPt) { $script:LastShownPt = $d.CurPt }
-        # 오늘 목표 달성 축하 (하루 1회)
+        # 목표 달성 축하 (기준 구간당 1회 - '오늘 0시' 기준이면 하루 1회, '실행 시점' 기준이면 세션 1회)
         $dg = [int]$script:Settings.DailyGoal
-        if ($dg -gt 0 -and $d.Diff -ge $dg -and $script:GoalCelebrated -ne [DateTime]::Today) {
-            $script:GoalCelebrated = [DateTime]::Today
-            Show-DeferredToast "오늘 목표 +$dg pt 달성! 🎉" $true 'up' 60
+        $period = [string]$(if ([string]$script:Settings.SessionBase -eq 'session') { "s$($script:SessionStartMs)" } else { [DateTime]::Today.ToString('yyyy-MM-dd') })
+        if ($dg -gt 0 -and $d.Diff -ge $dg -and $script:GoalCelebrated -ne $period) {
+            $script:GoalCelebrated = $period
+            Show-DeferredToast "$(Get-BasisLabel 'base') 목표 +$dg pt 달성! 🎉" $true 'up' 60
             $script:GameToastFired = $true
         }
     } catch {
@@ -4409,17 +4741,28 @@ function Show-OpponentResult {
         }
         $box = $script:OppWindows[$key]
         Set-StatWindow $box $d
-        # 닉네임 오른쪽에 배치 (화면 밖이면 안쪽으로)
-        $dipX = $o.X / $script:DpiScale + 40
-        $dipY = $o.Y / $script:DpiScale - 10
-        $scrW = [System.Windows.SystemParameters]::PrimaryScreenWidth
-        $scrH = [System.Windows.SystemParameters]::PrimaryScreenHeight
-        if ($dipX -gt $scrW - 300) { $dipX = $scrW - 300 }
-        if ($dipY -gt $scrH - 110) { $dipY = $scrH - 110 }
-        if ($dipY -lt 0) { $dipY = 0 }
-        $box.Win.Left = $dipX
-        $box.Win.Top = $dipY
-        if (-not $box.Win.IsVisible) { $box.Win.Show() }
+        $bw = $box.Win
+        # 좌/우 어느 쪽에 붙일지는 박스 폭을 알아야 정해진다 - 화면 밖에서 먼저 띄워 실측
+        if (-not $bw.IsVisible) {
+            $bw.Left = -20000
+            $bw.Show()
+        }
+        $bw.UpdateLayout()
+        $boxW = [double]$bw.ActualWidth
+        if ($boxW -le 0) { $boxW = 460 }
+        # 기준은 주 모니터가 아니라 게임 화면 영역 (창모드·보조 모니터·모니터 걸침 대응)
+        $g = Get-GameRectDip
+        $plateX = $o.X / $script:DpiScale
+        # 명패는 프로필 그림 아래에 있으므로, 박스 위쪽이 프로필 상단과 맞도록 그만큼 올린다
+        $dipY = $o.Y / $script:DpiScale - $g.H * 0.11
+        # 상단·오른쪽 자리(게임 화면 오른쪽 절반)는 명패 왼쪽에, 왼쪽 자리는 프로필을 비켜 오른쪽에
+        if (($plateX - $g.X) -gt $g.W * 0.5) { $dipX = $plateX - $boxW - $g.W * 0.012 } else { $dipX = $plateX + $g.W * 0.057 }
+        if ($dipX + $boxW -gt $g.X + $g.W) { $dipX = $g.X + $g.W - $boxW }
+        if ($dipX -lt $g.X) { $dipX = $g.X }
+        if ($dipY -gt $g.Y + $g.H - 110) { $dipY = $g.Y + $g.H - 110 }
+        if ($dipY -lt $g.Y) { $dipY = $g.Y }
+        $bw.Left = $dipX
+        $bw.Top = $dipY
     }
 }
 
