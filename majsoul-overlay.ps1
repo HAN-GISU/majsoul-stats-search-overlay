@@ -158,7 +158,7 @@ function Get-BasisStartMs {
         $c = 0
         if ($st) { $c = $st.count }
         if ($c -ge $N) { $lo = $mid } else { $hi = $mid }
-        Start-Sleep -Milliseconds 80
+        Wait-Api 80
     }
     return $lo
 }
@@ -3208,6 +3208,17 @@ function Show-Toast {
     } catch { if ($env:MJS_TOAST_DEBUG) { Write-Host "Toast error: $_" } }
 }
 
+# 스캔/갱신 작업이 UI를 점유 중이면 토스트를 미뤘다가 한가해진 시점(ApplicationIdle)에 띄움
+# - 바쁜 와중에 바로 띄우면 파티클 애니메이션이 그려지기도 전에 시계상으로 끝나버림
+function Show-DeferredToast {
+    param([string]$Text, [bool]$Positive, [string]$Fx = '', [int]$Magnitude = 0)
+    try {
+        $null = [Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
+            [Windows.Threading.DispatcherPriority]::ApplicationIdle,
+            [action] { Show-Toast $Text $Positive $Fx $Magnitude }.GetNewClosure())
+    } catch { Show-Toast $Text $Positive $Fx $Magnitude }
+}
+
 # ---- 리포트 카드 (일/주/월/연 탭 + 비동기 로딩) ----
 
 function Get-PeriodAnchor {
@@ -4291,7 +4302,7 @@ function Update-Overlay {
                 $pos = ($delta -ge 0)
                 $mag = [Math]::Abs($delta)
             }
-            Show-Toast $txt $pos $(if ($pos) { 'up' } else { 'down' }) $mag
+            Show-DeferredToast $txt $pos $(if ($pos) { 'up' } else { 'down' }) $mag
             $script:GameToastFired = $true
         }
         if ($script:TodayCount -ge 0) { $script:AnnouncedCount = $script:TodayCount }
@@ -4300,7 +4311,7 @@ function Update-Overlay {
         $dg = [int]$script:Settings.DailyGoal
         if ($dg -gt 0 -and $d.Diff -ge $dg -and $script:GoalCelebrated -ne [DateTime]::Today) {
             $script:GoalCelebrated = [DateTime]::Today
-            Show-Toast "오늘 목표 +$dg pt 달성! 🎉" $true 'up' 60
+            Show-DeferredToast "오늘 목표 +$dg pt 달성! 🎉" $true 'up' 60
             $script:GameToastFired = $true
         }
     } catch {
