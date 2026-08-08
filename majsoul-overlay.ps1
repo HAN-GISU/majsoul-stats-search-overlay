@@ -536,7 +536,7 @@ function Build-ReportPack {
     return @{ Mode = $Mode; Anchor = $s.ToString('yyyy-MM-dd'); Title = $title; N = $nTotal; Diff = $diffTotal; RankCounts = $rcTotal; Seq = @(); Pts = @(); Buckets = $buckets; StartLvl = $startLvl; StartPt = $startPt; EndLvl = $curLvlId; EndPt = $endPt }
 }
 
-# 스트릭: 연대율 기준 — 1·2위 = 승리(연승), 4위 = 라스(연속 라스)
+# 스트릭: 연대율 기준 — 1·2위 = 연대, 4위 = 라스(연속 라스)
 function Get-StreakText {
     param($Seq)
     if ($Seq.Count -lt 2) { return '' }
@@ -544,7 +544,7 @@ function Get-StreakText {
     if ($last -le 2) {
         $n = 0
         for ($i = $Seq.Count - 1; $i -ge 0 -and $Seq[$i] -le 2; $i--) { $n++ }
-        if ($n -ge 2) { return "🔥${n}연승" }
+        if ($n -ge 2) { return "🔥${n}연속 연대" }
     } elseif ($last -eq 4) {
         $n = 0
         for ($i = $Seq.Count - 1; $i -ge 0 -and $Seq[$i] -eq 4; $i--) { $n++ }
@@ -1709,6 +1709,9 @@ $BoxXaml = @'
             <TextBlock x:Name="TbScaleL" Text="박스 크기 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100" ToolTip="박스 위에서 Ctrl+마우스휠로도 조절" ToolTipService.InitialShowDelay="0"/>
             <ComboBox x:Name="CmbScale" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
           </StackPanel>
+          <TextBlock x:Name="TbSrcL" Text="── 전적 검색 사이트 / 자료 출처 ──" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.7" Margin="0,7,0,2"/>
+          <TextBlock x:Name="LnkSource" Text="https://amae-koromo.sapk.ch/" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.85"
+                     TextDecorations="Underline" Cursor="Hand" Margin="0,0,0,1" ToolTip="브라우저로 열기" ToolTipService.InitialShowDelay="0"/>
         </StackPanel>
       </StackPanel>
       <StackPanel x:Name="ScanPanel" Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Top"
@@ -1926,6 +1929,8 @@ function New-StatWindow {
         TbNickL = $w.FindName('TbNickL')
         TxNick = $w.FindName('TxNick')
         BtnNickApply = $w.FindName('BtnNickApply')
+        TbSrcL = $w.FindName('TbSrcL')
+        LnkSource = $w.FindName('LnkSource')
     }
     foreach ($cmb in @($box.CmbKeyScan, $box.CmbKeyClose, $box.CmbKeyExit)) {
         foreach ($k in $script:KeyOptions) { $null = $cmb.Items.Add($k) }
@@ -2075,6 +2080,11 @@ function New-StatWindow {
     })
     $box.TxNick.Add_KeyDown({
         if ($args[1].Key -eq 'Return') { Apply-Nickname ([string]$args[0].Text) }
+    })
+    # 자료 출처 링크 → 기본 브라우저로 열기
+    $box.LnkSource.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        try { Start-Process ([string]$args[0].Text).Trim() } catch {}
     })
     # 통계 기준 변경 → 캐시 비우고 새 기준으로 다시 조회
     $box.CmbBasisMy.Tag = 'MyBasis'
@@ -2245,7 +2255,7 @@ function Apply-Theme {
                       $Box.TbBasisMyL, $Box.TbBasisOppL, $Box.TbBasisWarn, $Box.BtnRefresh,
                       $Box.TbKeyScanL, $Box.TbKeyCloseL, $Box.TbKeyExitL, $Box.TbGoalL, $Box.TbBaseL, $Box.TbMinNL, $Box.TbScaleL, $Box.TbShowL, $Box.TbNickL, $Box.BtnNickApply,
                       $Box.TbSetupL, $Box.BtnSetupApply, $Box.TbAnomModeL, $Box.TbAnomHighL, $Box.TbAnomLowL, $Box.TbAnomPctL, $Box.BtnAdv, $Box.CbBadge, $Box.BtnBadgeAdv,
-                      $Box.TbShowL)) {
+                      $Box.TbShowL, $Box.TbSrcL, $Box.LnkSource)) {
         if ($tb) { $tb.Foreground = New-Brush $fg }
     }
     if ($shadow) {
@@ -2395,7 +2405,7 @@ $script:DispItems = @(
     @{ K = 'Tobi'; N = '토비율' }, @{ K = 'Wt'; N = '평균화료순' }, @{ K = 'Stat4'; N = '우형리치·선제리치율' },
     @{ K = 'Stable'; N = '안정단위' }, @{ K = 'Badge'; N = '스타일 배지' },
     @{ K = 'NameColor'; N = '닉네임 강함 색상' },
-    @{ K = 'SeqColor'; N = '오늘 순위 색상'; Me = $true }, @{ K = 'Streak'; N = '연승/연패 스트릭'; Me = $true },
+    @{ K = 'SeqColor'; N = '오늘 순위 색상'; Me = $true }, @{ K = 'Streak'; N = '연대/라스 스트릭'; Me = $true },
     @{ K = 'Spark'; N = '오늘 pt 그래프'; Me = $true }
 )
 $script:DispTarget = 'me'
@@ -3486,7 +3496,7 @@ function Fill-ReportContent {
             foreach ($r in $seq) {
                 if ($r -le 2) { $run++; if ($run -gt $best) { $best = $run } } else { $run = 0 }
             }
-            $Rw.FindName('RcStats2').Text = ('수지 {0}pt   최고 연승 {1}' -f $arrow, $best)
+            $Rw.FindName('RcStats2').Text = ('수지 {0}pt   최고 {1}연속 연대' -f $arrow, $best)
         } else {
             $bestB = $null
             foreach ($b in $bks) { if ([int]$b.N -gt 0 -and ($null -eq $bestB -or [int]$b.Diff -gt [int]$bestB.Diff)) { $bestB = $b } }
@@ -3892,8 +3902,8 @@ function Fill-ReportContent {
             } else {
                 $pg = $diff / $n
                 $lastRate = $rc[3] / $n
-                if ($diff -ge 200 -or ($pg -ge 30 -and $n -ge 3)) { $comment = '🚀 폭풍 성장의 날!' }
-                elseif ($rate -ge 0.6 -and $n -ge 5 -and $diff -gt 0) { $comment = '🔥 폼 미쳤습니다' }
+                if ($rate -ge 0.7 -and $n -ge 5 -and $diff -gt 0) { $comment = '🔥 폼 미쳤습니다' }
+                elseif ($diff -ge 200 -or ($pg -ge 30 -and $n -ge 3)) { $comment = '🚀 폭풍 성장의 날!' }
                 elseif ($diff -ge 80) { $comment = '📈 수확의 날이네요' }
                 elseif ($diff -gt 0) { $comment = '👍 준수한 하루' }
                 elseif ($diff -eq 0) { $comment = '무난한 하루였습니다' }
@@ -3917,10 +3927,14 @@ function Fill-ReportContent {
         } else {
             $lastRateP = 0.0
             if ($n -gt 0) { $lastRateP = $rc[3] / $n }
+            # 기간 내 최저 누적 수지 (낙폭 후 반등 감지용)
+            $minCum = 0; $cumV = 0
+            foreach ($b in $bks) { $cumV += [int]$b.Diff; if ($cumV -lt $minCum) { $minCum = $cumV } }
             if ($n -eq 0) { $comment = '이 기간엔 대국 기록이 없어요' }
+            elseif ($minCum -le -300 -and $diff -gt 0) { $comment = '🎢 바닥 찍고 반등한 구간!' }
             elseif ($diff -ge 500) { $comment = '📈 폭풍 성장 구간!' }
-            elseif ($diff -ge 150) { $comment = '📈 순항 중입니다' }
             elseif ($rate -ge 0.55 -and $diff -gt 0) { $comment = '🔥 흐름이 좋아요' }
+            elseif ($diff -ge 150) { $comment = '📈 순항 중입니다' }
             elseif ($diff -gt 0) { $comment = '👍 플러스로 마감한 구간' }
             elseif ($diff -le -500) { $comment = '💀 시련의 구간이었네요...' }
             elseif ($lastRateP -ge 0.4) { $comment = '⚰️ 라스가 유난히 잦았던 구간이네요' }
@@ -3941,8 +3955,8 @@ function Request-Report {
     Set-ReportTabs $rw $Mode
     $key = ('{0}|{1}' -f $Mode, $Anchor.ToString('yyyy-MM-dd'))
 
-    # 오늘-일간은 라이브 데이터로 즉시 표시
-    if ($Mode -eq 'day' -and $Anchor -eq [DateTime]::Today) {
+    # 오늘-일간은 라이브 데이터로 즉시 표시 (초기 로딩 전엔 라이브 데이터가 없으니 백그라운드 조회로)
+    if ($Mode -eq 'day' -and $Anchor -eq [DateTime]::Today -and $script:LastData) {
         $rc = @(0, 0, 0, 0)
         foreach ($r in @($script:TodaySeq)) { if ($r -ge 1 -and $r -le 4) { $rc[$r - 1]++ } }
         $diff = 0
@@ -4622,7 +4636,10 @@ if ($GameProcName) {
     $gameTimer.Start()
 }
 
-Update-Overlay
+# 창을 먼저 띄우고 데이터는 디스패처 시작 후 로드 (UiPump 덕분에 로딩 중에도 버튼·드래그 동작)
+if ($script:Nickname -and $script:Nickname -ne '여기에닉네임') { $my.TbName.Text = $script:Nickname } else { $my.TbName.Text = '전적 오버레이' }
+$my.TbRank.Text = '⏳ 전적 불러오는 중...'
 $win.Show()
+$null = $win.Dispatcher.BeginInvoke([Windows.Threading.DispatcherPriority]::Background, [action] { Update-Overlay })
 $app = New-Object Windows.Application
 $null = $app.Run($win)
