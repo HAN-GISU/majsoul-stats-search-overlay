@@ -411,7 +411,16 @@ function Build-ReportPack {
         $sl = 0; $sp = $null; $el = 0; $ep = $null
         if ($effS) { $sl = [int]$effS.Id; $sp = [int]$effS.Pt }
         if ($effE) { $el = [int]$effE.Id; $ep = [int]$effE.Pt }
-        return @{ Mode = 'day'; Anchor = $s.ToString('yyyy-MM-dd'); Title = ('{0}/{1}' -f $s.Month, $s.Day); N = $n; Diff = $diff; RankCounts = $rc; Seq = $seq; Pts = $pts; Lvls = $lvls; Buckets = @(); StartLvl = $sl; StartPt = $sp; EndLvl = $el; EndPt = $ep }
+        # 그날의 화료율/방총율 (한 줄 평 소재용, 실패해도 무시)
+        $hr = $null; $dl = $null
+        if ($n -gt 0) {
+            try {
+                Start-Sleep -Milliseconds 120
+                $ext = Invoke-RestMethod -Uri "$Api/player_extended_stats/$id/$sMs/$eMs`?mode=$($script:Modes)" -TimeoutSec 15
+                if ($ext) { $hr = [double]$ext.'和牌率'; $dl = [double]$ext.'放铳率' }
+            } catch {}
+        }
+        return @{ Mode = 'day'; Anchor = $s.ToString('yyyy-MM-dd'); Title = ('{0}/{1}' -f $s.Month, $s.Day); N = $n; Diff = $diff; RankCounts = $rc; Seq = $seq; Pts = $pts; Lvls = $lvls; Buckets = @(); StartLvl = $sl; StartPt = $sp; EndLvl = $el; EndPt = $ep; Hr = $hr; Dl = $dl }
     }
 
     # 주/시즌/월/년: 구간 버킷 집계
@@ -1437,6 +1446,26 @@ if ($riIdx -ge 0) {
     $rAnchor = [DateTime]::ParseExact([string]$args[$riIdx + 2], 'yyyy-MM-dd', $null)
     $pack = Build-ReportPack $rMode $rAnchor
     ConvertTo-Json -InputObject $pack -Depth 6 | Out-File (Join-Path $PSScriptRoot 'report-result.json') -Encoding utf8
+    exit 0
+}
+$diIdx = [Array]::IndexOf($args, '-DetailOnce')
+if ($diIdx -ge 0) {
+    # 일간 상세 지표 수집 백그라운드 프로세스: -DetailOnce <yyyy-MM-dd>
+    try {
+        $pos = Get-Content (Join-Path $PSScriptRoot 'overlay-pos.json') -Raw | ConvertFrom-Json
+        if ($pos.Settings.Nickname) { $script:Nickname = [string]$pos.Settings.Nickname }
+    } catch {}
+    $day = [DateTime]::ParseExact([string]$args[$diIdx + 1], 'yyyy-MM-dd', $null)
+    $sMs = [DateTimeOffset]::new($day).ToUnixTimeMilliseconds()
+    $eMs = [DateTimeOffset]::new($day.AddDays(1)).ToUnixTimeMilliseconds()
+    $ext = $null; $rst = $null
+    try {
+        $id = Get-PlayerId
+        $rst = Get-RangeStats $id $sMs $eMs
+        Start-Sleep -Milliseconds 120
+        $ext = Invoke-RestMethod -Uri "$Api/player_extended_stats/$id/$sMs/$eMs`?mode=$($script:Modes)" -TimeoutSec 15
+    } catch {}
+    ConvertTo-Json -InputObject @{ Anchor = $day.ToString('yyyy-MM-dd'); Ext = $ext; St = $rst } -Depth 6 | Out-File (Join-Path $PSScriptRoot 'detail-result.json') -Encoding utf8
     exit 0
 }
 
@@ -3048,6 +3077,8 @@ $script:ReportXaml = @'
       <Canvas x:Name="RcCum" Height="84" Margin="0,4,0,0" Visibility="Collapsed" ClipToBounds="True"/>
       <Canvas x:Name="RcCanvas" Height="64" Margin="0,12,0,0" ClipToBounds="True" Visibility="Collapsed"/>
       <StackPanel x:Name="RcInfoGrid" Margin="0,12,0,0"/>
+      <TextBlock x:Name="RcDetailBtn" Text="상세 지표 보기 +" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF7BA7E3" Margin="0,10,0,0" Cursor="Hand" Visibility="Collapsed"/>
+      <StackPanel x:Name="RcDetailGrid" Margin="0,4,0,0"/>
       <TextBlock x:Name="RcComment" FontFamily="Malgun Gothic" FontSize="15" FontWeight="Bold" Foreground="#FFFFD666" Margin="0,14,0,0" TextWrapping="Wrap"/>
       <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
         <Border CornerRadius="8" Background="#FF2E4266" Padding="12,6" Cursor="Hand">
@@ -3078,6 +3109,8 @@ function Set-ReportLoading {
     $Rw.FindName('RcDonutRow').Visibility = 'Collapsed'
     $Rw.FindName('RcBars').Visibility = 'Collapsed'
     $Rw.FindName('RcCanvas').Visibility = 'Collapsed'
+    $Rw.FindName('RcDetailBtn').Visibility = 'Collapsed'
+    $Rw.FindName('RcDetailGrid').Children.Clear()
     $rcC = $Rw.FindName('RcComment')
     $rcC.Cursor = $null
     $script:ReportFailed = $false
@@ -3119,6 +3152,51 @@ function Add-InfoRow {
     $null = $dp.Children.Add($vb)
     $null = $dp.Children.Add($lb)
     $null = $Panel.Children.Add($dp)
+}
+
+# 일간 상세 지표 렌더 (화료/방총/리치 등 — 율과 횟수 병기)
+function Fill-DayDetail {
+    param($Rw, $Res)
+    try {
+        $grid = $Rw.FindName('RcDetailGrid')
+        $grid.Children.Clear()
+        $ext = $Res.Ext
+        if (-not $ext -or $null -eq $ext.count -or [int]$ext.count -le 0) {
+            Add-InfoRow $grid '상세 지표' '데이터 없음' '#FF8A93A6'
+            return
+        }
+        $rounds = [int]$ext.count   # 그날의 총 국(局) 수
+        $hd = New-Object Windows.Controls.TextBlock
+        $hd.Text = ('상세 지표 — 총 {0}국(局) 기준' -f $rounds)
+        $hd.FontFamily = New-Object Windows.Media.FontFamily 'Malgun Gothic'
+        $hd.FontSize = 11; $hd.FontWeight = [Windows.FontWeights]::Bold
+        $hd.Foreground = New-Brush '#FF8A93A6'
+        $hd.Margin = New-Object Windows.Thickness 0, 6, 0, 4
+        $null = $grid.Children.Add($hd)
+        # 화료 횟수는 원본값(리치/후로/다마 화료 합), 나머지는 율×국수 반올림
+        $huleN = 0
+        foreach ($k in @('立直和了', '副露和了', '默听和了')) { if ($null -ne $ext.$k) { $huleN += [int]$ext.$k } }
+        $hr = [double]$ext.'和牌率'
+        Add-InfoRow $grid '화료율' ('{0:P1} ({1}회)' -f $hr, $huleN) '#FF7BE38B'
+        $dl = [double]$ext.'放铳率'
+        Add-InfoRow $grid '방총율' ('{0:P1} ({1}회)' -f $dl, [int][math]::Round($dl * $rounds)) '#FFFF7B7B'
+        $ri = [double]$ext.'立直率'
+        Add-InfoRow $grid '리치율' ('{0:P1} ({1}회)' -f $ri, [int][math]::Round($ri * $rounds))
+        $fu = [double]$ext.'副露率'
+        Add-InfoRow $grid '후로율' ('{0:P1} ({1}회)' -f $fu, [int][math]::Round($fu * $rounds))
+        $dmN = 0; if ($null -ne $ext.'默听和了') { $dmN = [int]$ext.'默听和了' }
+        Add-InfoRow $grid '다마화료율' ('{0:P1} ({1}회)' -f [double]$ext.'默听率', $dmN)
+        if ($null -ne $ext.'自摸率') { Add-InfoRow $grid '츠모율 (화료 중)' ('{0:P1}' -f [double]$ext.'自摸率') }
+        if ($null -ne $ext.'平均打点') { Add-InfoRow $grid '평균타점' ('{0:N0}' -f [double]$ext.'平均打点') '#FF7BE38B' }
+        if ($null -ne $ext.'最大累计番数') { Add-InfoRow $grid '최대 화료 번수' ('{0}판' -f [int]$ext.'最大累计番数') }
+        if ($null -ne $ext.'平均铳点') { Add-InfoRow $grid '평균방총점' ('{0:N0}' -f [double]$ext.'平均铳点') '#FFFF7B7B' }
+        $rst = $Res.St
+        if ($rst -and $null -ne $rst.negative_rate -and $null -ne $rst.count -and [int]$rst.count -gt 0) {
+            $tb = [double]$rst.negative_rate
+            Add-InfoRow $grid '토비율' ('{0:P1} ({1}회)' -f $tb, [int][math]::Round($tb * [int]$rst.count))
+        }
+        if ($null -ne $ext.'和了巡数') { Add-InfoRow $grid '평균화료순' ('{0:N2}순' -f [double]$ext.'和了巡数') }
+    } catch {}
 }
 
 function New-HitRect {
@@ -3551,25 +3629,66 @@ function Fill-ReportContent {
             if ($busiest) { Add-InfoRow $grid '최다 대국' ('{0}{1} ({2}국)' -f [string]$busiest.Label, $unit, [int]$busiest.N) }
         }
 
-        # 한 줄 평
+        # 상세 지표 (일간 전용, 버튼 클릭 시 백그라운드 로딩)
+        $dBtn = $Rw.FindName('RcDetailBtn')
+        $Rw.FindName('RcDetailGrid').Children.Clear()
+        if ($mode -eq 'day' -and $n -gt 0) {
+            $anchorStr = [string]$Pack.Anchor
+            if ($script:DetailCache.ContainsKey($anchorStr)) {
+                $dBtn.Visibility = 'Collapsed'
+                Fill-DayDetail $Rw $script:DetailCache[$anchorStr]
+            } elseif ($script:DetailProc -and -not $script:DetailProc.HasExited -and $script:DetailReqAnchor -eq $anchorStr) {
+                $dBtn.Text = '상세 지표 불러오는 중...'
+                $dBtn.Visibility = 'Visible'
+            } else {
+                $dBtn.Text = '상세 지표 보기 +'
+                $dBtn.Visibility = 'Visible'
+            }
+        } else {
+            $dBtn.Visibility = 'Collapsed'
+        }
+
+        # 한 줄 평 — 수지(총/국당) 중심 등급 + 연대/라스 특수 케이스 + 화료·방총 첨언
         if ($mode -eq 'day') {
-            $lasts = $rc[3]
             if ($n -eq 0) {
                 if (([string]$Pack.Anchor) -eq ([DateTime]::Today.ToString('yyyy-MM-dd'))) { $comment = '오늘은 아직 한 판도 안 쳤어요 🀄' }
                 else { $comment = '이 날은 대국 기록이 없어요' }
+            } else {
+                $pg = $diff / $n
+                $lastRate = $rc[3] / $n
+                if ($diff -ge 200 -or ($pg -ge 30 -and $n -ge 3)) { $comment = '🚀 오늘의 패보는 소장각. 이 기세면 승단이 마중 나옵니다' }
+                elseif ($rate -ge 0.7 -and $n -ge 5 -and $diff -gt 0) { $comment = ('🔥 연대율 {0:P0} — 오늘 흐름은 완전히 내 것이었네요' -f $rate) }
+                elseif ($diff -ge 80) { $comment = '📈 차곡차곡 쓸어 담은 수확의 날이네요' }
+                elseif ($diff -gt 0) { $comment = '👍 흑자는 흑자죠. 잃지 않는 마작이 제일 어렵습니다' }
+                elseif ($diff -eq 0) { $comment = '±0 — 수업료 한 푼 안 내고 버텼으면 잘한 겁니다' }
+                elseif ($lastRate -ge 0.5 -and $n -ge 4) { $comment = ('⚰️ 오늘은 라스의 날... {0}국 중 라스 {1}번이면 자리 탓 좀 해도 됩니다' -f $n, $rc[3]) }
+                elseif ($diff -le -200 -or ($pg -le -30 -and $n -ge 3)) { $comment = '💀 이 날은 접는 게 나았을지도...' }
+                elseif ($diff -le -80 -or ($pg -le -15 -and $n -ge 3)) { $comment = '🩸 제법 쓰라린 하루. 수업료는 여기까지만 냅시다' }
+                else { $comment = '📉 가벼운 찰과상 정도. 이만하면 잘 막았어요' }
+                # 화료율/방총율이 있으면 원인 한마디 (백그라운드 조회 시에만 채워짐)
+                $hr = $null; $dl = $null
+                if ($null -ne $Pack.Hr) { $hr = [double]$Pack.Hr }
+                if ($null -ne $Pack.Dl) { $dl = [double]$Pack.Dl }
+                if ($diff -lt 0) {
+                    if ($null -ne $dl -and $dl -ge 0.18) { $comment += "`n쏘인 게 너무 많았어요 (방총율 {0:P0})" -f $dl }
+                    elseif ($null -ne $hr -and $hr -le 0.15) { $comment += "`n화료가 안 터진 날 (화료율 {0:P0})" -f $hr }
+                    elseif ($null -ne $hr -and $null -ne $dl -and $hr -ge 0.22 -and $dl -le 0.13) { $comment += "`n내용은 나쁘지 않았는데 운이 야속했네요" }
+                } elseif ($diff -gt 0) {
+                    if ($null -ne $hr -and $hr -ge 0.28) { $comment += "`n화료 머신 가동 중 (화료율 {0:P0})" -f $hr }
+                    elseif ($null -ne $dl -and $dl -le 0.10) { $comment += "`n수비가 빛난 날 (방총율 {0:P0})" -f $dl }
+                }
             }
-            elseif ($rate -ge 0.6 -and $n -ge 5) { $comment = '🔥 폼 미쳤습니다' }
-            elseif ($diff -ge 150) { $comment = '📈 수확의 날이네요' }
-            elseif ($n -ge 3 -and ($lasts / $n) -ge 0.4) { $comment = '💀 이 날은 접는 게 나았을지도...' }
-            elseif ($rate -ge 0.5) { $comment = '👍 준수한 하루' }
-            elseif ($diff -lt 0) { $comment = '📉 내일의 나를 믿읍시다' }
-            else { $comment = '무난한 하루였습니다' }
         } else {
+            $lastRateP = 0.0
+            if ($n -gt 0) { $lastRateP = $rc[3] / $n }
             if ($n -eq 0) { $comment = '이 기간엔 대국 기록이 없어요' }
             elseif ($diff -ge 500) { $comment = '📈 폭풍 성장 구간!' }
             elseif ($diff -ge 150) { $comment = '📈 순항 중입니다' }
-            elseif ($rate -ge 0.55) { $comment = '🔥 흐름이 좋아요' }
-            elseif ($diff -lt -300) { $comment = '💀 시련의 구간이었네요...' }
+            elseif ($rate -ge 0.55 -and $diff -gt 0) { $comment = ('🔥 연대율 {0:P0}, 흐름 좋게 탄 구간' -f $rate) }
+            elseif ($diff -gt 0) { $comment = '👍 플러스로 마감한 구간' }
+            elseif ($diff -le -500) { $comment = '💀 시련의 구간이었네요...' }
+            elseif ($lastRateP -ge 0.4) { $comment = ('⚰️ 라스가 유난히 잦았던 구간 (라스율 {0:P0})' -f $lastRateP) }
+            elseif ($diff -le -150) { $comment = '🩸 손실이 좀 컸던 구간' }
             elseif ($diff -lt 0) { $comment = '📉 다음 구간을 노려봅시다' }
             else { $comment = '꾸준히 진행 중' }
         }
@@ -3693,6 +3812,25 @@ function Show-ReportCard {
             if ($a -gt (Get-PeriodAnchor $m ([DateTime]::Today))) { return }
             Request-Report $m $a
         })
+        # 상세 지표 로딩 (일간 전용) - 리포트 다른 부분은 그대로 두고 이 영역만 백그라운드로 채움
+        $rw.FindName('RcDetailBtn').Add_MouseLeftButtonDown({
+            $args[1].Handled = $true
+            $w = [Windows.Window]::GetWindow($args[0])
+            $st = $w.Tag
+            if ([string]$st.Mode -ne 'day') { return }
+            $anchorStr = ([DateTime]$st.Anchor).ToString('yyyy-MM-dd')
+            if ($script:DetailCache.ContainsKey($anchorStr)) { return }
+            if ($script:DetailProc -and -not $script:DetailProc.HasExited) {
+                Show-Toast '이미 상세 지표를 불러오는 중이에요' $false
+                return
+            }
+            try { Remove-Item (Join-Path $PSScriptRoot 'detail-result.json') -Force -ErrorAction SilentlyContinue } catch {}
+            $script:DetailReqAnchor = $anchorStr
+            $script:DetailStart = Get-Date
+            $script:DetailProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-DetailOnce', $anchorStr
+            $args[0].Text = '상세 지표 불러오는 중...'
+            $script:DetailPollTimer.Start()
+        })
         # PNG 저장
         $rw.FindName('RcSave').Add_MouseLeftButtonDown({
             $args[1].Handled = $true
@@ -3768,6 +3906,47 @@ $reportPollTimer.Add_Tick({
     }
 })
 $script:ReportPollTimer = $reportPollTimer
+
+# 일간 상세 지표 백그라운드 수집 감시
+$script:DetailProc = $null
+$script:DetailStart = $null
+$script:DetailReqAnchor = ''
+$script:DetailCache = @{}
+$detailPollTimer = New-Object Windows.Threading.DispatcherTimer
+$detailPollTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+$detailPollTimer.Add_Tick({
+    if (-not $script:DetailProc) { $script:DetailPollTimer.Stop(); return }
+    if (-not $script:DetailProc.HasExited) {
+        if ($script:DetailStart -and ((Get-Date) - $script:DetailStart).TotalSeconds -gt 60) {
+            try { $script:DetailProc.Kill() } catch {}
+        }
+        return
+    }
+    $script:DetailProc = $null
+    $script:DetailPollTimer.Stop()
+    $res = $null
+    try { $res = Get-Content (Join-Path $PSScriptRoot 'detail-result.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    $ok = ($res -and $res.Ext -and $null -ne $res.Ext.count)
+    # 오늘 날짜는 대국이 계속 추가되므로 캐시하지 않음
+    if ($ok -and ([string]$res.Anchor) -ne ([DateTime]::Today.ToString('yyyy-MM-dd'))) {
+        $script:DetailCache[[string]$res.Anchor] = $res
+    }
+    $rw = $script:ReportWin
+    if (-not $rw) { return }
+    try {
+        $cur = $rw.Tag
+        if ([string]$cur.Mode -ne 'day') { return }
+        if ((([DateTime]$cur.Anchor).ToString('yyyy-MM-dd')) -ne $script:DetailReqAnchor) { return }
+        $btn = $rw.FindName('RcDetailBtn')
+        if ($ok) {
+            $btn.Visibility = 'Collapsed'
+            Fill-DayDetail $rw $res
+        } else {
+            $btn.Text = '상세 지표 불러오기 실패 — 다시 시도'
+        }
+    } catch {}
+})
+$script:DetailPollTimer = $detailPollTimer
 
 # --- 내 전적 박스 ---
 $script:Theme = 'light'
