@@ -3656,15 +3656,15 @@ function Fill-ReportContent {
             } else {
                 $pg = $diff / $n
                 $lastRate = $rc[3] / $n
-                if ($diff -ge 200 -or ($pg -ge 30 -and $n -ge 3)) { $comment = '🚀 오늘의 패보는 소장각. 이 기세면 승단이 마중 나옵니다' }
-                elseif ($rate -ge 0.7 -and $n -ge 5 -and $diff -gt 0) { $comment = ('🔥 연대율 {0:P0} — 오늘 흐름은 완전히 내 것이었네요' -f $rate) }
-                elseif ($diff -ge 80) { $comment = '📈 차곡차곡 쓸어 담은 수확의 날이네요' }
-                elseif ($diff -gt 0) { $comment = '👍 흑자는 흑자죠. 잃지 않는 마작이 제일 어렵습니다' }
-                elseif ($diff -eq 0) { $comment = '±0 — 수업료 한 푼 안 내고 버텼으면 잘한 겁니다' }
-                elseif ($lastRate -ge 0.5 -and $n -ge 4) { $comment = ('⚰️ 오늘은 라스의 날... {0}국 중 라스 {1}번이면 자리 탓 좀 해도 됩니다' -f $n, $rc[3]) }
+                if ($diff -ge 200 -or ($pg -ge 30 -and $n -ge 3)) { $comment = '🚀 폭풍 성장의 날!' }
+                elseif ($rate -ge 0.6 -and $n -ge 5 -and $diff -gt 0) { $comment = '🔥 폼 미쳤습니다' }
+                elseif ($diff -ge 80) { $comment = '📈 수확의 날이네요' }
+                elseif ($diff -gt 0) { $comment = '👍 준수한 하루' }
+                elseif ($diff -eq 0) { $comment = '무난한 하루였습니다' }
+                elseif ($lastRate -ge 0.5 -and $n -ge 4) { $comment = '⚰️ 오늘은 라스의 날... 자리 탓 합시다' }
                 elseif ($diff -le -200 -or ($pg -le -30 -and $n -ge 3)) { $comment = '💀 이 날은 접는 게 나았을지도...' }
-                elseif ($diff -le -80 -or ($pg -le -15 -and $n -ge 3)) { $comment = '🩸 제법 쓰라린 하루. 수업료는 여기까지만 냅시다' }
-                else { $comment = '📉 가벼운 찰과상 정도. 이만하면 잘 막았어요' }
+                elseif ($diff -le -80 -or ($pg -le -15 -and $n -ge 3)) { $comment = '🩸 꽤 아픈 하루였네요' }
+                else { $comment = '📉 내일의 나를 믿읍시다' }
                 # 화료율/방총율이 있으면 원인 한마디 (백그라운드 조회 시에만 채워짐)
                 $hr = $null; $dl = $null
                 if ($null -ne $Pack.Hr) { $hr = [double]$Pack.Hr }
@@ -3684,10 +3684,10 @@ function Fill-ReportContent {
             if ($n -eq 0) { $comment = '이 기간엔 대국 기록이 없어요' }
             elseif ($diff -ge 500) { $comment = '📈 폭풍 성장 구간!' }
             elseif ($diff -ge 150) { $comment = '📈 순항 중입니다' }
-            elseif ($rate -ge 0.55 -and $diff -gt 0) { $comment = ('🔥 연대율 {0:P0}, 흐름 좋게 탄 구간' -f $rate) }
+            elseif ($rate -ge 0.55 -and $diff -gt 0) { $comment = '🔥 흐름이 좋아요' }
             elseif ($diff -gt 0) { $comment = '👍 플러스로 마감한 구간' }
             elseif ($diff -le -500) { $comment = '💀 시련의 구간이었네요...' }
-            elseif ($lastRateP -ge 0.4) { $comment = ('⚰️ 라스가 유난히 잦았던 구간 (라스율 {0:P0})' -f $lastRateP) }
+            elseif ($lastRateP -ge 0.4) { $comment = '⚰️ 라스가 유난히 잦았던 구간이네요' }
             elseif ($diff -le -150) { $comment = '🩸 손실이 좀 컸던 구간' }
             elseif ($diff -lt 0) { $comment = '📉 다음 구간을 노려봅시다' }
             else { $comment = '꾸준히 진행 중' }
