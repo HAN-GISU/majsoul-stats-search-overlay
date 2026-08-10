@@ -1,6 +1,6 @@
 ﻿# 작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
 
-**v1.0.5** · © 2026 [HAN-GISU](https://github.com/HAN-GISU) · MIT License
+**v1.0.6** · © 2026 [HAN-GISU](https://github.com/HAN-GISU) · MIT License
 
 작혼(Mahjong Soul) 게임 화면 위에 나와 상대의 전적을 실시간으로 띄워주는 Windows 오버레이입니다.
 게임 파일이나 통신에 일절 개입하지 않고 화면 위에 창을 얹는 방식입니다.

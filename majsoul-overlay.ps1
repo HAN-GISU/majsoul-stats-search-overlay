@@ -1,6 +1,6 @@
 ﻿# ═══════════════════════════════════════════════════════════
 #  작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
-#  v1.0.5  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
+#  v1.0.6  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
 #  데이터: amae-koromo(雀魂牌谱屋) 공개 API — 게임에 개입하지 않음
 # ═══════════════════════════════════════════════════════════
 
@@ -1132,19 +1132,42 @@ function Get-OpponentData {
     $oppMajNow = ([int][math]::Floor([int]$effOpp.Id / 100)) % 100
     $suffix = ''
     $suffix2 = ''
+    $suffixTier = ''    # 1번째 줄(주 기준) 자체의 구간 색
+    $suffix2Tier = ''   # 2번째 줄(병행 기준) 자체의 구간 색
     $colorVal = $null
     $oppTier = ''
     if (-not $SkipStable) {
-    $bLabel = Get-BasisLabel $finalBasis
-    if ($finalBasis -ne $oppBasis) { $bLabel = (Get-BasisLabel $oppBasis) + '→' + $bLabel }
-    # 한 모드의 (통계, 안정단, 국수) 묶음
+    # 모드별 최종 기준 라벨 - 확장 경로('1개월→전체') 대신 최종 기준만 간결하게 표시
+    $mkLabel = {
+        param([string]$b)
+        return Get-BasisLabel $b
+    }
+    # 한 모드의 (통계, 안정단, 국수, 최종 기준) 묶음
+    # 모드별 최소 표본: 공유 구간에서 이 모드 국수가 부족하면 이 모드만 더 긴 기간으로 개별 확장
+    # (전체 통계의 확장은 합산 국수 기준이라, 병행 표시의 한쪽이 소수 표본으로 남는 문제 방지)
     $calc = {
         param([int]$m)
-        $ms = Get-RangeStats $Id $statStart $nowPlus -ModeFilter "$m"
-        if (-not $ms -or -not $ms.count) { $ms = Get-RangeStats $Id $EpochStart $nowPlus -ModeFilter "$m" }
+        $mBasis = $finalBasis
+        $mStart = $statStart
+        $ms = Get-RangeStats $Id $mStart $nowPlus -ModeFilter "$m"
+        if ($minN -gt 0 -and $mBasis -match '^(m1|m3|m6|y1)$') {
+            $ladder = @('m1', 'm3', 'm6', 'y1', 'all')
+            $li = [Array]::IndexOf($ladder, $mBasis)
+            while ((-not $ms -or [int]$ms.count -lt $minN) -and $li -lt $ladder.Count - 1) {
+                $li++
+                $mBasis = $ladder[$li]
+                $mStart = Get-BasisStart $Id $nowPlus $mBasis -Iters 11
+                $m2 = Get-RangeStats $Id $mStart $nowPlus -ModeFilter "$m"
+                if ($m2) { $ms = $m2 }
+            }
+        }
+        if (-not $ms -or -not $ms.count) {
+            $ms = Get-RangeStats $Id $EpochStart $nowPlus -ModeFilter "$m"
+            $mBasis = 'all'
+        }
         $st2 = $null
         if ($ms -and $ms.count) { $st2 = Get-StableLevel $ms $m }
-        return @{ M = $m; N = $(if ($ms) { [int]$ms.count } else { 0 }); S = $st2 }
+        return @{ M = $m; N = $(if ($ms) { [int]$ms.count } else { 0 }); S = $st2; B = $mBasis }
     }
     if ($oppMajNow -eq 6) {
         # 혼천은 별도 pt 체계라 안정단위 공식이 성립하지 않음
@@ -1155,7 +1178,7 @@ function Get-OpponentData {
         # 수동 고정 모드
         $r1 = & $calc ([int]$script:Settings.OppStableMode)
         if ($r1.S) {
-            $suffix = '  안정 ' + $r1.S.Text + ' (' + $ModeNames[$r1.M] + '·' + $bLabel + ' 기준 · ' + $r1.N + '국)'
+            $suffix = '  안정 ' + $r1.S.Text + ' (' + $ModeNames[$r1.M] + '·' + (& $mkLabel $r1.B) + ' 기준 · ' + $r1.N + '국)'
             $colorVal = $r1.S.Val
             $oppTier = Get-StableTier ([double]$r1.S.Val)
         }
@@ -1192,6 +1215,7 @@ function Get-OpponentData {
             if (-not $pri -and -not $sec) {
                 $suffix = '  안정 전적 부족 (금탁 ' + $goldN + '국)'
                 $oppTier = 'none'
+                $suffixTier = 'none'
                 $colorVal = 0.0
             }
         } elseif ($room -ge 11 -and $room -le 12) {
@@ -1201,6 +1225,7 @@ function Get-OpponentData {
             else {
                 $suffix = '  안정 전적 부족 (옥 ' + $jadeN + '국·금 ' + $goldN + '국)'
                 $oppTier = 'none'
+                $suffixTier = 'none'
                 $colorVal = 0.0
             }
         } else {
@@ -1210,18 +1235,21 @@ function Get-OpponentData {
         }
         if (-not $suffix) {
             $parts = @()
+            $tiers = @()
             $best = $null
             foreach ($rr in @($pri, $sec)) {
                 if ($rr -and $rr.S) {
-                    $parts += ('안정 ' + $rr.S.Text + ' (' + $ModeNames[$rr.M] + '·' + $rr.N + '국·' + $bLabel + ' 기준)')
-                    $best = $rr
+                    $parts += ('안정 ' + $rr.S.Text + ' (' + $ModeNames[$rr.M] + '·' + $rr.N + '국·' + (& $mkLabel $rr.B) + ' 기준)')
+                    $tiers += (Get-StableTier ([double]$rr.S.Val))
+                    # 닉네임 색은 두 기준 중 높은 쪽 (안정단 값은 연속 단일 척도)
+                    if (-not $best -or ([double]$rr.S.Val -gt [double]$best.S.Val)) { $best = $rr }
                 }
             }
             if ($parts.Count -gt 0) {
-                # 병행(금+옥)은 가로 폭이 넓어지지 않도록 두 줄로
+                # 병행(금+옥)은 가로 폭이 넓어지지 않도록 두 줄로 - 줄마다 자기 구간 색
                 $suffix = '  ' + $parts[0]
-                if ($parts.Count -gt 1) { $suffix2 = '  ' + $parts[1] }
-                # 색상은 실질 실력(옥 기준이 있으면 옥) 기준
+                $suffixTier = $tiers[0]
+                if ($parts.Count -gt 1) { $suffix2 = '  ' + $parts[1]; $suffix2Tier = $tiers[1] }
                 $colorVal = $best.S.Val
                 $oppTier = Get-StableTier ([double]$best.S.Val)
             }
@@ -1234,6 +1262,8 @@ function Get-OpponentData {
         Name     = $stats.nickname
         NameSuffix = $suffix
         NameSuffix2 = $suffix2
+        SuffixTier = $suffixTier
+        SuffixTier2 = $suffix2Tier
         Badges = $badges
         NameColorVal = $colorVal
         StableTier = $oppTier
@@ -1249,8 +1279,10 @@ function Get-OpponentData {
         StatParts = $statParts
         RankMajor = (([int][math]::Floor([int]$effOpp.Id / 100)) % 100)
         IsOpp = $true
+        StablePhase = (-not [bool]$SkipStable)   # false면 아직 안정단 미계산(1차 부분 데이터)
     }
-    $script:OppCache["$Id"] = $d
+    # -SkipStable 1차 부분 결과는 캐시 금지 - 캐시되면 2차 전체 조회가 이걸 돌려받아 안정단이 영영 안 채워짐
+    if (-not $SkipStable) { $script:OppCache["$Id"] = $d }
     return $d
 }
 
@@ -2139,6 +2171,7 @@ function Scan-Opponents {
     $script:ScanOnProgress = $OnProgress   # 매칭 확정 즉시 1명씩 알림 (Notify-NewFound)
     $found = @{}
     $deadline = (Get-Date).AddSeconds(990)   # 부모의 안전망(999초)보다 조금 먼저 스스로 종료
+    $stopFlag = Join-Path $PSScriptRoot 'scan-stop.flag'
     $try = 0
     while ($true) {
         # 목표 인원: 화면에 내 닉이 보이면(=내 대국) 3명, 아니면(관전 등) 4명
@@ -2146,6 +2179,8 @@ function Scan-Opponents {
         if ($script:SawMyNick) { $target = 3 }
         if ($found.Count -ge $target) { break }
         if ((Get-Date) -ge $deadline) { break }
+        # 사용자 우아한 중지: 탐색만 끝내고 (호출부의) 안정단 채움은 계속 진행
+        if (Test-Path $stopFlag) { $null = $script:ScanLog.Add('>>> 사용자 중지 - 여기까지 결과로 마무리'); break }
         if ($try -gt 0) { Start-Sleep -Milliseconds $(if ($try -lt 3) { 500 } else { 2000 }) }
         # 재시도마다 조회 예산 소량 리필 (재시도는 대부분 캐시 히트라 실제 추가 조회는 적음)
         if ($try -gt 0 -and $script:ScanQueryLeft -lt 30) { $script:ScanQueryLeft = 30 }
@@ -2339,29 +2374,63 @@ if ($args -contains '-ScanOnce') {
     } catch {}
     $resPath = Join-Path $PSScriptRoot 'scan-result.json'
     $dataCache = @{}
-    # 1차: 안정단위 없이 빠르게 조회해 즉시 표시 (사람 먼저) - 중지/강제 종료돼도 여기까지는 표시됨
-    $saveOpps = {
+    # 현재 dataCache 상태를 결과 파일로 기록 (부모가 쓰기 시각 변화를 감지해 즉시 반영)
+    # Room/SawMy 동봉: 부모가 안정단 워커(-StableOnce)에 방 정보를 전달하는 데 사용
+    $writeOpps = {
         param($Opps)
         $out = @()
         foreach ($o in $Opps) {
             $key = "$($o.Id)"
-            if (-not $dataCache[$key]) { $dataCache[$key] = Get-OpponentData $o.Id -SkipStable }
             if ($dataCache[$key]) {
-                $out += [pscustomobject]@{ Id = $key; X = [double]$o.X; Y = [double]$o.Y; Data = $dataCache[$key] }
+                $out += [pscustomobject]@{
+                    Id = $key; X = [double]$o.X; Y = [double]$o.Y; Data = $dataCache[$key]
+                    Room = [int]$script:ScanRoomMode; SawMy = [bool]$script:SawMyNick
+                }
             }
         }
         ConvertTo-Json -InputObject $out -Depth 6 | Out-File $resPath -Encoding utf8
     }
+    # 부분 데이터(안정단 제외)만 빠르게 저장 - 안정단은 부모가 별도 워커로 병렬 계산 (탐색을 막지 않음)
+    $saveOpps = {
+        param($Opps)
+        foreach ($o in $Opps) {
+            $key = "$($o.Id)"
+            if (-not $dataCache[$key]) { $dataCache[$key] = Get-OpponentData $o.Id -SkipStable }
+        }
+        & $writeOpps $Opps
+    }
     $opps = Scan-Opponents -OnProgress $saveOpps
     & $saveOpps $opps
-    # 2차: 안정단위를 채워 한 명씩 갱신 (박스가 제자리에서 업데이트됨)
-    foreach ($o in $opps) {
-        $key = "$($o.Id)"
-        $full = Get-OpponentData $o.Id
-        if ($full) {
-            $dataCache[$key] = $full
-            & $saveOpps $opps
+    exit 0
+}
+$stoIdx = [Array]::IndexOf($args, '-StableOnce')
+if ($stoIdx -ge 0) {
+    # 안정단 전용 백그라운드 워커: -StableOnce <room> <sawMy 0/1> <id1.id2...>
+    # 스캔과 병렬로 돌며 한 명 끝날 때마다 stable-<id>.json으로 전달 (부모 StablePollTimer가 수거)
+    try {
+        $pos = Get-Content (Join-Path $PSScriptRoot 'overlay-pos.json') -Raw | ConvertFrom-Json
+        if ($pos.Settings.OppBasis) { $script:Settings.OppBasis = [string]$pos.Settings.OppBasis }
+        if ($pos.Settings.Stable -is [bool]) { $script:Settings.Stable = $pos.Settings.Stable }
+        if ($pos.Settings.OppStableMode) { $script:Settings.OppStableMode = [string]$pos.Settings.OppStableMode }
+        if ($pos.Settings.StableDual -is [bool]) { $script:Settings.StableDual = $pos.Settings.StableDual }
+        if ($pos.Settings.Nickname) { $script:Nickname = [string]$pos.Settings.Nickname }
+        if ($null -ne $pos.Settings.OppMinN) { $script:Settings.OppMinN = [int]$pos.Settings.OppMinN }
+    } catch {}
+    $script:ScanRoomMode = [int]$args[$stoIdx + 1]
+    $script:SawMyNick = ([string]$args[$stoIdx + 2] -eq '1')
+    # 방 미확정 시 폴백(내 주력 추정)은 스캔 자식과 같은 경로: scan-box.json의 Room
+    try {
+        $rf = Join-Path $PSScriptRoot 'scan-box.json'
+        if (Test-Path $rf) {
+            $bx = Get-Content $rf -Raw | ConvertFrom-Json
+            if ($null -ne $bx.Room) { $script:RoomGuess = [int]$bx.Room }
         }
+    } catch {}
+    foreach ($oid in (([string]$args[$stoIdx + 3]) -split '\.')) {
+        if (-not $oid) { continue }
+        $d = $null
+        try { $d = Get-OpponentData $oid } catch {}
+        if ($d) { ConvertTo-Json -InputObject $d -Depth 6 | Out-File (Join-Path $PSScriptRoot "stable-$oid.json") -Encoding utf8 }
     }
     exit 0
 }
@@ -2523,6 +2592,11 @@ $BoxXaml = @'
             <ComboBox x:Name="CmbGoal" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
           </StackPanel>
           <StackPanel Orientation="Horizontal" Margin="0,5,0,1">
+            <TextBlock x:Name="TbNickL" Text="내 닉네임 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100" ToolTip="비운 채로 적용하면 닉네임 미설정 초기 상태로 되돌립니다" ToolTipService.InitialShowDelay="0"/>
+            <TextBox x:Name="TxNick" FontFamily="Malgun Gothic" FontSize="12" Width="105" VerticalContentAlignment="Center"/>
+            <TextBlock x:Name="BtnNickApply" Text=" 적용" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Padding="6,0,0,0" Cursor="Hand"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,5,0,1">
             <TextBlock x:Name="TbKeyScanL" Text="스캔 키 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
             <ComboBox x:Name="CmbKeyScan" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
           </StackPanel>
@@ -2534,19 +2608,9 @@ $BoxXaml = @'
             <TextBlock x:Name="TbKeyExitL" Text="종료 키 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
             <ComboBox x:Name="CmbKeyExit" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
           </StackPanel>
-          <StackPanel Orientation="Horizontal" Margin="0,5,0,1">
-            <TextBlock x:Name="TbNickL" Text="내 닉네임 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
-            <TextBox x:Name="TxNick" FontFamily="Malgun Gothic" FontSize="12" Width="105" VerticalContentAlignment="Center"/>
-            <TextBlock x:Name="BtnNickApply" Text=" 적용" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Padding="6,0,0,0" Cursor="Hand"/>
-          </StackPanel>
           <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
             <TextBlock x:Name="TbScaleL" Text="박스 크기 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100" ToolTip="박스 위에서 Ctrl+마우스휠로도 조절" ToolTipService.InitialShowDelay="0"/>
             <ComboBox x:Name="CmbScale" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
-          </StackPanel>
-          <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
-            <TextBlock x:Name="TbPosL" Text="박스 위치 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
-            <TextBlock x:Name="BtnPosReset" Text="내 프로필 위로 되돌리기" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E"
-                       VerticalAlignment="Center" Cursor="Hand" TextDecorations="Underline" Opacity="0.85"/>
           </StackPanel>
           <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
             <TextBlock x:Name="TbTxtColL" Text="기본 글자색 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
@@ -2560,7 +2624,10 @@ $BoxXaml = @'
           </StackPanel>
           <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
             <TextBlock x:Name="TbBgAlphaL" Text="배경 투명도 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
-            <ComboBox x:Name="CmbBgAlpha" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
+            <TextBox x:Name="TxBgAlpha" FontFamily="Malgun Gothic" FontSize="12" Width="32" MaxLength="3" VerticalContentAlignment="Center" HorizontalContentAlignment="Center"/>
+            <TextBlock x:Name="TbBgAlphaPct" Text="%" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Padding="2,0,6,0"/>
+            <Slider x:Name="SldBgAlpha" Width="106" Minimum="0" Maximum="100" SmallChange="1" IsMoveToPointEnabled="True" VerticalAlignment="Center"/>
+            <TextBlock x:Name="BtnBgAlphaReset" Text=" 테마 기본" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.8" VerticalAlignment="Center" Cursor="Hand" Padding="6,0,0,0" TextDecorations="Underline"/>
           </StackPanel>
           <TextBlock x:Name="TbPresetL" Text="── 프리셋 (테마·설정 전체 저장) ──" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.7" Margin="0,7,0,2"/>
           <StackPanel Orientation="Horizontal" Margin="0,1,0,1">
@@ -2802,8 +2869,6 @@ function New-StatWindow {
         CmbMinN = $w.FindName('CmbMinN')
         TbScaleL = $w.FindName('TbScaleL')
         CmbScale = $w.FindName('CmbScale')
-        TbPosL = $w.FindName('TbPosL')
-        BtnPosReset = $w.FindName('BtnPosReset')
         TbShowL = $w.FindName('TbShowL')
         DispPanel = $w.FindName('DispPanel')
         TbNickL = $w.FindName('TbNickL')
@@ -2815,7 +2880,10 @@ function New-StatWindow {
         SwBgCol = $w.FindName('SwBgCol')
         BtnBgColReset = $w.FindName('BtnBgColReset')
         TbBgAlphaL = $w.FindName('TbBgAlphaL')
-        CmbBgAlpha = $w.FindName('CmbBgAlpha')
+        TxBgAlpha = $w.FindName('TxBgAlpha')
+        TbBgAlphaPct = $w.FindName('TbBgAlphaPct')
+        SldBgAlpha = $w.FindName('SldBgAlpha')
+        BtnBgAlphaReset = $w.FindName('BtnBgAlphaReset')
         SwTxtCol = $w.FindName('SwTxtCol')
         BtnTxtColReset = $w.FindName('BtnTxtColReset')
         TbPresetL = $w.FindName('TbPresetL')
@@ -2878,10 +2946,19 @@ function New-StatWindow {
         $args[1].Handled = $true
         Update-Opponents
     })
-    # ✕ 클릭: 상대 박스 모두 닫기 (F7과 동일)
+    # ✕ 클릭: 내 박스에서는 상대 박스 모두 닫기(F7), 상대 박스에서는 그 박스만 닫기 (오인식 정리용)
+    $box.BtnCloseOpp.Tag = $box
     $box.BtnCloseOpp.Add_MouseLeftButtonDown({
         $args[1].Handled = $true
-        Close-Opponents
+        $b = $args[0].Tag
+        $key = [string]$b.Win.Tag
+        if ($key -and $script:OppWindows.ContainsKey($key)) {
+            $script:OppClosed[$key] = $true   # 스캔 부분 갱신이 이 박스를 되살리지 않게
+            try { $script:OppWindows[$key].Win.Close() } catch {}
+            $script:OppWindows.Remove($key)
+        } else {
+            Close-Opponents
+        }
     })
     # ⟳ 클릭: 즉시 새로고침 (진행 중엔 ⏳ 표시, 완료 시 토스트)
     $box.BtnRefresh.Add_MouseLeftButtonDown({
@@ -3121,14 +3198,6 @@ function New-StatWindow {
         Save-Pos
         Update-Overlay
     })
-    # 박스 위치 기본값(내 프로필 위)으로 되돌리기
-    if ($box.BtnPosReset) {
-        $box.BtnPosReset.Add_MouseLeftButtonDown({
-            $args[1].Handled = $true
-            Set-MyBoxDefaultPos
-            Save-Pos
-        })
-    }
     # 기본 글자색 변경/초기화
     $box.SwTxtCol.Add_MouseLeftButtonDown({
         $args[1].Handled = $true
@@ -3169,17 +3238,29 @@ function New-StatWindow {
         foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
         Sync-TxtColSwatch
     })
-    foreach ($ba in $script:BgAlphaOptions) {
-        if ($ba -lt 0) { $null = $box.CmbBgAlpha.Items.Add('테마 기본') }
-        else { $null = $box.CmbBgAlpha.Items.Add("$ba%") }
-    }
-    $box.CmbBgAlpha.Add_SelectionChanged({
+    # 투명도 슬라이더: 드래그 중엔 즉시 반영만 하고, 저장은 드래그가 끝날 때 (파일 쓰기 스팸 방지)
+    $box.SldBgAlpha.Add_ValueChanged({
         if ($script:SyncingUI) { return }
-        $c = $args[0]
-        if ($c.SelectedIndex -lt 0) { return }
-        $script:Settings.BgAlpha = [int]$script:BgAlphaOptions[$c.SelectedIndex]
-        Save-Pos
-        foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
+        Set-BgAlpha ([int][math]::Round($args[1].NewValue)) $false
+    })
+    $box.SldBgAlpha.Add_LostMouseCapture({ Save-Pos })
+    $box.SldBgAlpha.Add_LostFocus({ Save-Pos })
+    # 수치 입력칸: Enter 또는 포커스 이탈 시 적용 (값이 그대로면 '테마 기본' 상태 유지)
+    $box.TxBgAlpha.Add_KeyDown({
+        if ($args[1].Key -eq 'Return') {
+            $v = 0
+            if ([int]::TryParse(([string]$args[0].Text).Trim(), [ref]$v) -and $v -ne (Get-EffBgAlpha)) { Set-BgAlpha $v }
+            else { Sync-TxtColSwatch }
+        }
+    })
+    $box.TxBgAlpha.Add_LostFocus({
+        $v = 0
+        if ([int]::TryParse(([string]$args[0].Text).Trim(), [ref]$v) -and $v -ne (Get-EffBgAlpha)) { Set-BgAlpha $v }
+        else { Sync-TxtColSwatch }
+    })
+    $box.BtnBgAlphaReset.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        Set-BgAlpha (-1)
     })
     # 프리셋 저장/불러오기/삭제
     $box.BtnPresetSave.Tag = $box
@@ -3316,16 +3397,31 @@ function Apply-Theme {
         $Box.SetRoot.Background = New-Brush $setBg
         $Box.SetTitle.Foreground = New-Brush $fg
         $Box.SetClose.Foreground = New-Brush $fg
+        # 설정 탭 버튼: 활성=강조·밑줄, 비활성=흐리게
+        if ($Box.SetTabs) {
+            for ($sti = 0; $sti -lt $Box.SetTabs.Count; $sti++) {
+                $stb = $Box.SetTabs[$sti]
+                $stb.Foreground = New-Brush $fg
+                if ($sti -eq [int]$script:SetTabIdx) {
+                    $stb.FontWeight = [Windows.FontWeights]::ExtraBold
+                    $stb.Opacity = 1.0
+                    $stb.TextDecorations = [Windows.TextDecorations]::Underline
+                } else {
+                    $stb.FontWeight = [Windows.FontWeights]::Bold
+                    $stb.Opacity = 0.55
+                    $stb.TextDecorations = $null
+                }
+            }
+        }
     }
     foreach ($tb in @($Box.TbName, $Box.TbRank, $Box.TbGoal, $Box.TbGame, $Box.TbStat, $Box.TbStat2, $Box.TbStat3, $Box.TbStat4, $Box.TbStat5, $Box.TbHelp,
                       $Box.BtnHelp, $Box.BtnSettings, $Box.BtnTheme, $Box.BtnReport, $Box.BtnScan, $Box.BtnCloseOpp,
                       $Box.CbToast, $Box.CbMortal, $Box.CbAnom,
                       $Box.TbBasisMyL, $Box.TbBasisOppL, $Box.TbBasisWarn, $Box.BtnRefresh,
                       $Box.TbKeyScanL, $Box.TbKeyCloseL, $Box.TbKeyExitL, $Box.TbGoalL, $Box.TbBaseL, $Box.TbMinNL, $Box.TbScaleL, $Box.TbShowL, $Box.TbNickL, $Box.BtnNickApply,
-                      $Box.TbPosL, $Box.BtnPosReset,
                       $Box.TbSetupL, $Box.BtnSetupApply, $Box.TbAnomModeL, $Box.TbAnomHighL, $Box.TbAnomLowL, $Box.TbAnomPctL, $Box.BtnAdv, $Box.CbBadge, $Box.BtnBadgeAdv, $Box.CbStableOn, $Box.BtnStableAdv,
                       $Box.TbShowL, $Box.TbSrcL, $Box.LnkSource,
-                      $Box.TbTxtColL, $Box.BtnTxtColReset, $Box.TbBgColL, $Box.BtnBgColReset, $Box.TbBgAlphaL,
+                      $Box.TbTxtColL, $Box.BtnTxtColReset, $Box.TbBgColL, $Box.BtnBgColReset, $Box.TbBgAlphaL, $Box.TbBgAlphaPct, $Box.BtnBgAlphaReset,
                       $Box.TbPresetL, $Box.BtnPresetSave, $Box.BtnPresetLoad, $Box.BtnPresetDel)) {
         if ($tb) { $tb.Foreground = New-Brush $fg }
     }
@@ -3366,7 +3462,28 @@ function Save-Pos {
 function Apply-Nickname {
     param([string]$NewNick)
     $NewNick = ([string]$NewNick).Trim()
-    if (-not $NewNick -or $NewNick -eq $script:Nickname) { return }
+    if ($NewNick -eq $script:Nickname) { return }
+    if (-not $NewNick) {
+        # 빈 닉 적용 = 닉네임 미설정 초기 상태로 되돌림 (첫 실행 온보딩과 동일)
+        $script:Nickname = ''
+        $script:PlayerId = 0
+        $script:CachedId = 0
+        $script:ExtCache = $null
+        $script:BasisCache = @{}
+        $script:TodayDate = $null
+        $script:ForceReset = $true
+        $script:LastShownPt = $null
+        $script:LastData = $null
+        $script:Settings.Nickname = ''
+        Save-Pos
+        if ($script:MyBox) {
+            $script:MyBox.TxSetupNick.Text = ''
+            $script:MyBox.SetupPanel.Visibility = 'Visible'
+        }
+        Show-Toast '닉네임 초기화 - 박스의 입력칸에 닉네임을 넣어 주세요' $true
+        Update-Overlay
+        return
+    }
     $script:Nickname = $NewNick
     $script:PlayerId = 0
     $script:CachedId = 0
@@ -3401,7 +3518,6 @@ function Refresh-All {
 # 박스/리포트 크기 배율 적용 (0.6~2.0)
 $script:ScaleSteps = @(0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0)
 $script:AnomPctOptions = @(5, 10, 15, 20, 25, 30, 40, 50)
-$script:BgAlphaOptions = @(-1, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
 
 function Apply-Scale {
     param($Box)
@@ -3412,6 +3528,13 @@ function Apply-Scale {
         if ([math]::Abs($s - 1.0) -lt 0.001) { $Box.RootBorder.LayoutTransform = $null }
         else { $Box.RootBorder.LayoutTransform = New-Object Windows.Media.ScaleTransform $s, $s }
     } catch {}
+    # 설정 별도 창도 같은 배율로
+    if ($Box.SetRoot) {
+        try {
+            if ([math]::Abs($s - 1.0) -lt 0.001) { $Box.SetRoot.LayoutTransform = $null }
+            else { $Box.SetRoot.LayoutTransform = New-Object Windows.Media.ScaleTransform $s, $s }
+        } catch {}
+    }
 }
 
 function Apply-ScaleAll {
@@ -3440,6 +3563,27 @@ function Set-UiScale {
     }
 }
 
+# 현재 유효 배경 투명도 (설정값, -1이면 테마 기본을 %로 환산)
+function Get-EffBgAlpha {
+    $av = [int]$script:Settings.BgAlpha
+    if ($av -ge 0) { return $av }
+    switch ($script:Theme) {
+        'dark'  { return 32 }
+        'trans' { return 0 }
+        default { return 78 }
+    }
+}
+
+# 배경 투명도 적용 (0~100, -1=테마 기본). Persist=false면 저장 없이 화면만 갱신 (드래그 중)
+function Set-BgAlpha {
+    param([int]$V, [bool]$Persist = $true)
+    if ($V -ge 0) { $V = [math]::Max(0, [math]::Min(100, $V)) }
+    $script:Settings.BgAlpha = $V
+    if ($Persist) { Save-Pos }
+    foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
+    Sync-TxtColSwatch
+}
+
 # 기본 글자색 견본 동기화
 function Sync-TxtColSwatch {
     $b = $script:MyBox
@@ -3463,10 +3607,11 @@ function Sync-TxtColSwatch {
         }
         try { $b.SwBgCol.Background = New-Brush $bc } catch {}
     }
-    if ($b.CmbBgAlpha -and $b.CmbBgAlpha.Items.Count -gt 0) {
+    if ($b.SldBgAlpha) {
         $script:SyncingUI = $true
-        $ai = [Array]::IndexOf($script:BgAlphaOptions, [int]$script:Settings.BgAlpha)
-        $b.CmbBgAlpha.SelectedIndex = [math]::Max(0, $ai)
+        $av = Get-EffBgAlpha
+        $b.SldBgAlpha.Value = $av
+        $b.TxBgAlpha.Text = [string]$av
         $script:SyncingUI = $false
     }
 }
@@ -4155,7 +4300,13 @@ function Set-StatWindow {
         $sfx = New-Object Windows.Documents.Run
         $sfx.Text = $sfxText
         $sfx.FontSize = [math]::Max(10, $Box.TbName.FontSize - 4.5)
-        if ($null -ne $Data.NameColorVal -and (Test-DispOn 'NameColor' $isOppBox)) { $sfx.Foreground = $nameRun.Foreground }
+        if ($null -ne $Data.NameColorVal -and (Test-DispOn 'NameColor' $isOppBox)) {
+            # 각 줄은 자기 구간 색 (금 기준 작호=주황, 옥 기준 작걸=노랑처럼 따로) - 없으면 닉네임 색
+            $st1 = ''
+            try { $st1 = [string]$Data.SuffixTier } catch {}
+            if ($st1) { $sfx.Foreground = New-Brush (Get-StableTierColor $st1) }
+            else { $sfx.Foreground = $nameRun.Foreground }
+        }
         $Box.TbName.Inlines.Add($sfx)
         if ($sfx2Text) {
             # 병행(금+옥) 두 번째 기준은 다음 줄에
@@ -4165,6 +4316,11 @@ function Set-StatWindow {
             $sfx2.FontSize = $sfx.FontSize
             $sfx2.FontWeight = $sfx.FontWeight
             $sfx2.Foreground = $sfx.Foreground
+            if ($null -ne $Data.NameColorVal -and (Test-DispOn 'NameColor' $isOppBox)) {
+                $st2 = ''
+                try { $st2 = [string]$Data.SuffixTier2 } catch {}
+                if ($st2) { $sfx2.Foreground = New-Brush (Get-StableTierColor $st2) }
+            }
             $Box.TbName.Inlines.Add($sfx2)
         }
     }
@@ -5610,6 +5766,7 @@ $script:SettingsShellXaml = @'
         <TextBlock x:Name="SetClose" Text="✕" DockPanel.Dock="Right" FontFamily="Malgun Gothic" FontSize="14" FontWeight="Bold" Foreground="#FF8A93A6" Cursor="Hand" Padding="8,0,0,0"/>
         <TextBlock x:Name="SetTitle" Text="⚙ 설정" FontFamily="Malgun Gothic" FontSize="14.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8"/>
       </DockPanel>
+      <StackPanel x:Name="SetTabStrip" Orientation="Horizontal" Margin="0,0,0,4"/>
       <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="760" Padding="0,0,10,0">
         <ScrollViewer.Resources>
           <!-- 안드로이드풍 슬림 스크롤바: 화살표 없이 얇은 둥근 썸만 -->
@@ -5643,6 +5800,35 @@ $script:SettingsShellXaml = @'
   </Border>
 </Window>
 '@
+
+# 요소(또는 자손)의 x:Name으로 설정 탭 소속 판별 - 매핑에 없으면 -1 (호출부에서 직전 탭 유지)
+function Get-SetTabIndex {
+    param($El, $Map)
+    $n = ''
+    try { $n = [string]$El.Name } catch {}
+    if ($n) { $v = $Map[$n]; if ($null -ne $v) { return [int]$v } }
+    if ($El -is [Windows.Controls.Panel]) {
+        foreach ($c in $El.Children) {
+            $r = Get-SetTabIndex $c $Map
+            if ($r -ge 0) { return $r }
+        }
+    }
+    return -1
+}
+
+# 설정 창 탭 전환: 해당 탭 패널만 표시, 버튼 스타일은 Apply-Theme가 테마색에 맞춰 갱신
+function Select-SetTab {
+    param([int]$Idx)
+    $script:SetTabIdx = $Idx
+    for ($i = 0; $i -lt $script:SetTabPanels.Count; $i++) {
+        if ($i -eq $Idx) { $script:SetTabPanels[$i].Visibility = 'Visible' }
+        else { $script:SetTabPanels[$i].Visibility = 'Collapsed' }
+    }
+    if ($script:MyBox) { Apply-Theme $script:MyBox }
+}
+$script:SetTabIdx = 0
+$script:SetTabPanels = @()
+$script:SetTabBtns = @()
 
 $my = New-StatWindow $BoxXaml
 $win = $my.Win
@@ -5726,12 +5912,54 @@ try {
     $my.Panel.Children.Remove($my.SettingsPanel)
     $sw2.FindName('SetHost').Content = $my.SettingsPanel
     $my.SettingsPanel.Visibility = 'Visible'
+    # 탭 분할: SettingsPanel 자식들을 탭별 패널로 재분배 (탭 추가 = SetTabDefs 배열 + 매핑에 항목 추가가 전부)
+    $script:SetTabDefs = @('설정', '닉네임/키/프리셋')
+    $tabMap = @{ TbNickL = 1; TbKeyScanL = 1; TbKeyCloseL = 1; TbKeyExitL = 1; TbPresetL = 1; TxPreset = 1; CmbPreset = 1; TbScaleL = 0; TbSrcL = 0; LnkSource = 0 }
+    $script:SetTabPanels = @()
+    $script:SetTabBtns = @()
+    $strip = $sw2.FindName('SetTabStrip')
+    for ($ti = 0; $ti -lt $script:SetTabDefs.Count; $ti++) {
+        $tp = New-Object Windows.Controls.StackPanel
+        $tp.Visibility = 'Collapsed'
+        $script:SetTabPanels += $tp
+        $tb = New-Object Windows.Controls.TextBlock
+        $tb.Text = [string]$script:SetTabDefs[$ti]
+        $tb.FontFamily = New-Object Windows.Media.FontFamily 'Malgun Gothic'
+        $tb.FontSize = 12.5
+        $tb.FontWeight = [Windows.FontWeights]::Bold
+        $tb.Padding = New-Object Windows.Thickness 0, 1, 16, 2
+        $tb.Cursor = [Windows.Input.Cursors]::Hand
+        $tb.Tag = $ti
+        $tb.Add_MouseLeftButtonDown({ $args[1].Handled = $true; Select-SetTab ([int]$args[0].Tag) })
+        $script:SetTabBtns += $tb
+        $null = $strip.Children.Add($tb)
+    }
+    $kids = @()
+    foreach ($k in $my.SettingsPanel.Children) { $kids += $k }
+    $my.SettingsPanel.Children.Clear()
+    $cur = 0
+    foreach ($k in $kids) {
+        $ki = Get-SetTabIndex $k $tabMap
+        if ($ki -ge 0) { $cur = $ki }
+        $null = $script:SetTabPanels[$cur].Children.Add($k)
+    }
+    foreach ($tp in $script:SetTabPanels) { $null = $my.SettingsPanel.Children.Add($tp) }
+    $my | Add-Member -NotePropertyName SetTabs -NotePropertyValue $script:SetTabBtns -Force
     $my | Add-Member -NotePropertyName SetRoot -NotePropertyValue ($sw2.FindName('SetRoot')) -Force
     $my | Add-Member -NotePropertyName SetTitle -NotePropertyValue ($sw2.FindName('SetTitle')) -Force
     $my | Add-Member -NotePropertyName SetClose -NotePropertyValue ($sw2.FindName('SetClose')) -Force
     $sw2.FindName('SetClose').Add_MouseLeftButtonDown({ $args[1].Handled = $true; $script:SettingsWin.Hide() })
     $sw2.Add_MouseLeftButtonDown({ try { $script:SettingsWin.DragMove() } catch {} })
+    # 설정 창 위에서도 Ctrl+휠 크기 조절
+    $sw2.Add_PreviewMouseWheel({
+        if ([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Control) {
+            $args[1].Handled = $true
+            $step = $(if ($args[1].Delta -gt 0) { 0.05 } else { -0.05 })
+            Set-UiScale ([double]$script:Settings.UiScale + $step)
+        }
+    })
     $script:SettingsWin = $sw2
+    Select-SetTab $script:SetTabIdx
 } catch {}
 
 Apply-Theme $my
@@ -5748,6 +5976,15 @@ if (-not $script:Nickname -or $script:Nickname -eq '여기에닉네임') {
 }
 
 function Update-Overlay {
+    # 닉네임 미설정(첫 실행/초기화) 상태 - 조회 없이 안내만
+    if (-not $script:Nickname -or $script:Nickname -eq '여기에닉네임') {
+        $my.TbName.Text = '전적 오버레이'
+        $my.TbRank.Text = '닉네임을 입력해 주세요'
+        $my.TbGame.Text = ''
+        foreach ($t in @($my.TbGoal, $my.TbStat, $my.TbStat2, $my.TbStat3, $my.TbStat4, $my.TbStat5)) { if ($t) { $t.Text = '' } }
+        try { $my.SparkCanvas.Children.Clear() } catch {}
+        return
+    }
     if ($script:NetBusy) { return }   # 갱신 중 타이머/버튼 재진입 방지
     $script:NetBusy = $true
     try {
@@ -5838,6 +6075,9 @@ function Update-Opponents {
     Write-ScanBoxFile
     $script:ScanShownWrite = $null
     $script:ScanBoxRefresh = 0
+    $script:ScanStopping = $false
+    $script:OppClosed = @{}   # 새 스캔 시작 - 이전에 닫은 박스 제한 해제
+    try { Remove-Item (Join-Path $PSScriptRoot 'scan-stop.flag') -Force -ErrorAction SilentlyContinue } catch {}
     $script:ScanStartTime = Get-Date
     $script:ScanProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-ScanOnce'
     $script:ScanPollTimer.Start()
@@ -5859,6 +6099,15 @@ function Show-OpponentResult {
         $d = $o.Data
         if (-not $d) { continue }
         $key = [string]$o.Id
+        # 사용자가 ✕로 닫은 박스는 이번 스캔 동안 다시 띄우지 않음
+        if ($script:OppClosed -and $script:OppClosed.ContainsKey($key)) { continue }
+        # 이미 안정단까지 채워 표시한 상대를 부분 데이터로 되돌리지 않음 (워커 결과 유실/깜박임 방지)
+        $old = $script:OppCache[$key]
+        $oldFull = $false
+        try { $oldFull = [bool]$old.StablePhase } catch {}
+        $newFull = $false
+        try { $newFull = [bool]$d.StablePhase } catch {}
+        if ($old -and $oldFull -and -not $newFull) { $d = $old }
         $script:OppCache[$key] = $d
         if (-not $script:OppWindows.ContainsKey($key)) {
             $box = New-StatWindow $OppXaml
@@ -5867,6 +6116,7 @@ function Show-OpponentResult {
             $script:OppWindows[$key] = $box
             Apply-Theme $box
             Apply-Scale $box
+            $box.BtnCloseOpp.ToolTip = '이 박스 닫기'
         }
         $box = $script:OppWindows[$key]
         Set-StatWindow $box $d
@@ -5895,6 +6145,31 @@ function Show-OpponentResult {
     }
 }
 
+# 안정단 미계산 상대를 별도 워커 프로세스로 병렬 계산 요청 (스캔과 독립 - 탐색을 막지 않음)
+function Request-StableFill {
+    param($Entries)
+    if (-not [bool]$script:Settings.Stable) { return }
+    $room = 0
+    $sawMy = $true
+    $need = @()
+    foreach ($e in $Entries) {
+        if ($null -ne $e.Room) { $room = [int]$e.Room }
+        if ($null -ne $e.SawMy) { $sawMy = [bool]$e.SawMy }
+        $key = [string]$e.Id
+        if ($script:OppClosed -and $script:OppClosed.ContainsKey($key)) { continue }
+        $full = $false
+        try { $full = [bool]$e.Data.StablePhase } catch {}
+        $cachedFull = $false
+        try { $cachedFull = [bool]$script:OppCache[$key].StablePhase } catch {}
+        if (-not $full -and -not $cachedFull -and -not $script:StableReq.ContainsKey($key)) { $need += $key }
+    }
+    if ($need.Count -eq 0) { return }
+    foreach ($k in $need) { $script:StableReq[$k] = Get-Date }
+    $sm = $(if ($sawMy) { '1' } else { '0' })
+    $null = Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-StableOnce', "$room", $sm, ($need -join '.')
+    $script:StablePollTimer.Start()
+}
+
 # 스캔 중 표시 (펄스 애니메이션)
 function Show-ScanIndicator {
     Hide-ScanIndicator
@@ -5919,9 +6194,22 @@ function Show-ScanIndicator {
         $iw.Left = $script:MyBox.Win.Left
         $iw.Top = $script:MyBox.Win.Top - 64
         if ($iw.Top -lt 0) { $iw.Top = $script:MyBox.Win.Top + 150 }
-        # 클릭 = 수동 중지: 자식 프로세스를 종료하면 폴 타이머가 부분 결과를 표시함
+        # 1차 클릭 = 우아한 중지(탐색만 멈추고 찾은 사람 안정단은 채운 뒤 종료), 2차 클릭 = 즉시 종료
         $iw.Add_MouseLeftButtonDown({
-            try { if ($script:ScanProc -and -not $script:ScanProc.HasExited) { $script:ScanProc.Kill() } } catch {}
+            try {
+                if (-not $script:ScanStopping) {
+                    $script:ScanStopping = $true
+                    New-Item -ItemType File (Join-Path $PSScriptRoot 'scan-stop.flag') -Force | Out-Null
+                    if ($script:ScanIndicator) {
+                        try {
+                            $script:ScanIndicator.FindName('TbScanMain').Text = '🔍 스캔 마무리 중...'
+                            $script:ScanIndicator.FindName('TbScanSub').Text = '한 번 더 클릭하면 즉시 종료 (안정단은 따로 채워짐)'
+                        } catch {}
+                    }
+                } elseif ($script:ScanProc -and -not $script:ScanProc.HasExited) {
+                    $script:ScanProc.Kill()
+                }
+            } catch {}
         })
         $iw.Show()
         $an = New-Object Windows.Media.Animation.DoubleAnimation
@@ -5971,6 +6259,8 @@ if ($AutoScanMinutes -gt 0) {
 $script:ScanProc = $null
 $script:ScanStartTime = $null
 $script:ScanIndicator = $null
+$script:ScanStopping = $false
+$script:OppClosed = @{}          # 사용자가 ✕로 개별 닫은 상대 박스 (이번 스캔 동안 재표시 금지)
 $script:LastScanSecs = 50
 $script:ScanShownWrite = $null   # 부분 결과 파일에서 마지막으로 표시한 시점
 $script:ScanBoxRefresh = 0       # 상대 박스가 새로 뜬 뒤 scan-box.json 재기록 횟수
@@ -5983,10 +6273,12 @@ $scanPollTimer.Add_Tick({
         return
     }
     if (-not $script:ScanProc.HasExited) {
-        # 경과 시간 표시 갱신 (중지는 사용자가 인디케이터 클릭으로)
-        if ($script:ScanStartTime -and $script:ScanIndicator) {
+        # 경과 시간 표시 갱신 (중지는 사용자가 인디케이터 클릭으로, 마무리 중 문구는 덮지 않음)
+        if ($script:ScanStartTime) {
             $sec = [int]((Get-Date) - $script:ScanStartTime).TotalSeconds
-            try { $script:ScanIndicator.FindName('TbScanMain').Text = "🔍 상대 스캔 중... $sec`초" } catch {}
+            if ($script:ScanIndicator -and -not $script:ScanStopping) {
+                try { $script:ScanIndicator.FindName('TbScanMain').Text = "🔍 상대 스캔 중... $sec`초" } catch {}
+            }
             # 비정상 상황 안전망 (999초)
             if ($sec -gt 999) { try { $script:ScanProc.Kill() } catch {} }
         }
@@ -5999,11 +6291,12 @@ $scanPollTimer.Add_Tick({
                     $entries = @(Get-Content $resFile -Raw -Encoding UTF8 | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ })
                     if ($entries.Count -gt 0) {
                         Show-OpponentResult $entries
+                        Request-StableFill $entries
                         $script:ScanShownWrite = $wt
                         # 새로 뜬 박스 좌표를 자식에 전달 - 박스 안 텍스트가 다음 재시도의 OCR 잡음이 되지 않게
                         # (표시 직후엔 레이아웃 전이라 크기가 0일 수 있어 다음 틱에 한 번 더 씀)
                         $script:ScanBoxRefresh = 2
-                        if ($script:ScanIndicator) {
+                        if ($script:ScanIndicator -and -not $script:ScanStopping) {
                             try { $script:ScanIndicator.FindName('TbScanSub').Text = "$($entries.Count)명 표시됨 · 클릭하면 여기까지 결과로 중지" } catch {}
                         }
                     }
@@ -6018,6 +6311,8 @@ $scanPollTimer.Add_Tick({
     }
     $script:ScanProc = $null
     $script:ScanPollTimer.Stop()
+    $script:ScanStopping = $false
+    try { Remove-Item (Join-Path $PSScriptRoot 'scan-stop.flag') -Force -ErrorAction SilentlyContinue } catch {}
     $took = 0
     if ($script:ScanStartTime) { $took = [int]((Get-Date) - $script:ScanStartTime).TotalSeconds }
     Hide-ScanIndicator
@@ -6034,9 +6329,38 @@ $scanPollTimer.Add_Tick({
         # '보통 N초' 표시는 성공한 스캔의 소요 시간만 반영
         if ($took -ge 5 -and $took -le 300) { $script:LastScanSecs = $took }
         Show-OpponentResult $entries
+        Request-StableFill $entries
     }
 })
 $script:ScanPollTimer = $scanPollTimer
+
+# 안정단 워커(-StableOnce) 결과 수거: stable-<id>.json이 생기는 즉시 해당 박스만 갱신
+$script:StableReq = @{}
+try { Remove-Item (Join-Path $PSScriptRoot 'stable-*.json') -Force -ErrorAction SilentlyContinue } catch {}
+$stablePollTimer = New-Object Windows.Threading.DispatcherTimer
+$stablePollTimer.Interval = [TimeSpan]::FromMilliseconds(600)
+$stablePollTimer.Add_Tick({
+    $done = @()
+    foreach ($k in @($script:StableReq.Keys)) {
+        $f = Join-Path $PSScriptRoot "stable-$k.json"
+        if (Test-Path $f) {
+            try {
+                $d = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($d) {
+                    $script:OppCache[$k] = $d
+                    if ($script:OppWindows.ContainsKey($k)) { Set-StatWindow $script:OppWindows[$k] $d }
+                }
+            } catch {}
+            try { Remove-Item $f -Force -ErrorAction SilentlyContinue } catch {}
+            $done += $k
+        } elseif (((Get-Date) - $script:StableReq[$k]).TotalSeconds -gt 240) {
+            $done += $k   # 워커 실패/실종 - 포기 (다음 스캔에서 재시도)
+        }
+    }
+    foreach ($k in $done) { $script:StableReq.Remove($k) }
+    if ($script:StableReq.Count -eq 0) { $script:StablePollTimer.Stop() }
+})
+$script:StablePollTimer = $stablePollTimer
 
 # 클립보드 감시: 작혼 기보 링크가 복사되면 모탈 리뷰 페이지 자동 오픈
 $script:LastClip = ''
