@@ -98,12 +98,13 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경�
 작성되었습니다.
 
 인식 엔진(선택, 엔진 포함판에 동봉)은 PaddleOCR-json
-(hiroi-sora, Apache-2.0 - 전문은 LICENSE 참조)을 사용합니다.
+(hiroi-sora, Apache-2.0 - 전문은 THIRD-PARTY-NOTICES.txt 참조)을
+사용합니다.
   https://github.com/hiroi-sora/PaddleOCR-json
 
 안정단위 계산식과 상수는 amae-koromo(雀魂牌谱屋)의 구현을 그대로
 옮겨온 것입니다. 원저작권(c) 2020 SAPikachu, MIT License 고지는
-LICENSE 파일에 포함되어 있습니다.
+THIRD-PARTY-NOTICES.txt에 포함되어 있습니다.
   https://github.com/SAPikachu/amae-koromo
 
 ════════════════════════════════════════════════════

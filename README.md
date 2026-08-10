@@ -81,8 +81,8 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경�
 ## 크레딧
 
 - 전적 데이터: [amae-koromo (雀魂牌谱屋)](https://amae-koromo.sapk.ch/)
-- 인식 엔진(선택, 엔진 포함판에 동봉): [PaddleOCR-json](https://github.com/hiroi-sora/PaddleOCR-json) (hiroi-sora, Apache-2.0 — 전문은 [LICENSE](LICENSE) 참조)
-- 안정단위 계산식과 상수는 [amae-koromo](https://github.com/SAPikachu/amae-koromo)의 구현(`estimateStableLevel2`)을 그대로 옮겨온 것입니다. 원저작권(© 2020 SAPikachu, MIT License) 고지는 [LICENSE](LICENSE) 파일에 포함되어 있습니다.
+- 인식 엔진(선택, 엔진 포함판에 동봉): [PaddleOCR-json](https://github.com/hiroi-sora/PaddleOCR-json) (hiroi-sora, Apache-2.0 — 전문은 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) 참조)
+- 안정단위 계산식과 상수는 [amae-koromo](https://github.com/SAPikachu/amae-koromo)의 구현(`estimateStableLevel2`)을 그대로 옮겨온 것입니다. 원저작권(© 2020 SAPikachu, MIT License) 고지는 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)에 포함되어 있습니다.
 - 이 프로젝트의 코드는 AI 도구(Anthropic Claude)를 활용해 작성되었습니다.
 
 ## 라이선스
