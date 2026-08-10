@@ -1,5 +1,5 @@
 ﻿════════════════════════════════════════════════════
- 작혼 전적 검색 오버레이 v1.0.4  © 2026 HAN-GISU
+ 작혼 전적 검색 오버레이 v1.0.5  © 2026 HAN-GISU
 ════════════════════════════════════════════════════
 
 게임 화면 위에 나와 상대의 전적을 띄워주는 오버레이입니다.
@@ -102,8 +102,10 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경�
 사용합니다.
   https://github.com/hiroi-sora/PaddleOCR-json
 
-안정단위 계산식과 상수는 amae-koromo(雀魂牌谱屋)의 구현을 그대로
-옮겨온 것입니다. 원저작권(c) 2020 SAPikachu, MIT License 고지는
+안정단위 계산식과 상수는 amae-koromo(雀魂牌谱屋)의 구현을
+기반으로 일부 수정한 것입니다(모드별 상수, 금탁·동장 확장).
+안정단위는 기준 구간에서 가장 많이 친 모드의 통계만으로
+계산하며, 라벨에 그 모드를 병기합니다 (예: 금남·1개월 기준). 원저작권(c) 2020 SAPikachu, MIT License 고지는
 THIRD-PARTY-NOTICES.txt에 포함되어 있습니다.
   https://github.com/SAPikachu/amae-koromo
 

@@ -2,7 +2,7 @@ Third-party notices for majsoul-stats-search-overlay
 =====================================================
 
 This project contains code derived from amae-koromo (https://github.com/SAPikachu/amae-koromo).
-The stable-level estimation formula and its constants were ported from that project.
+The stable-level estimation formula and its constants were ported and adapted from that project.
 
 MIT License
 

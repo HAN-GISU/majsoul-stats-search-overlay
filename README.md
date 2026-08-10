@@ -1,6 +1,6 @@
 ﻿# 작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
 
-**v1.0.4** · © 2026 [HAN-GISU](https://github.com/HAN-GISU) · MIT License
+**v1.0.5** · © 2026 [HAN-GISU](https://github.com/HAN-GISU) · MIT License
 
 작혼(Mahjong Soul) 게임 화면 위에 나와 상대의 전적을 실시간으로 띄워주는 Windows 오버레이입니다.
 게임 파일이나 통신에 일절 개입하지 않고 화면 위에 창을 얹는 방식입니다.
@@ -71,6 +71,7 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경�
 - 대국 종료 후 사이트 반영까지 **보통 5~15분, 길면 수십 분** 걸릴 수 있습니다. 오버레이는 30초마다 확인하므로 사이트에 뜨는 즉시 반영됩니다.
 - 집계 범위는 4인 금의 방 이상 단위전입니다. 은/동의 방, 3인, 이벤트 대국은 포함되지 않으며, 금의 방 기록이 없는 유저는 검색되지 않습니다.
 - 통계 기준(전체 / 최근 N개월 / 최근 N국)은 설정에서 나와 상대 각각 바꿀 수 있습니다.
+- 안정단위는 기준 구간에서 가장 많이 친 모드(주력 모드)의 통계만으로 계산하며, 라벨에 그 모드를 병기합니다 (예: `금남·1개월 기준`).
 
 ## 안전성과 이용약관
 
@@ -82,7 +83,7 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경�
 
 - 전적 데이터: [amae-koromo (雀魂牌谱屋)](https://amae-koromo.sapk.ch/)
 - 인식 엔진(선택, 엔진 포함판에 동봉): [PaddleOCR-json](https://github.com/hiroi-sora/PaddleOCR-json) (hiroi-sora, Apache-2.0 — 전문은 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) 참조)
-- 안정단위 계산식과 상수는 [amae-koromo](https://github.com/SAPikachu/amae-koromo)의 구현(`estimateStableLevel2`)을 그대로 옮겨온 것입니다. 원저작권(© 2020 SAPikachu, MIT License) 고지는 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)에 포함되어 있습니다.
+- 안정단위 계산식과 상수는 [amae-koromo](https://github.com/SAPikachu/amae-koromo)의 구현(`estimateStableLevel2`)을 기반으로 일부 수정한 것입니다(모드별 순위 보너스·페널티 적용, 금탁·동장 연속값 확장). 원저작권(© 2020 SAPikachu, MIT License) 고지는 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)에 포함되어 있습니다.
 - 이 프로젝트의 코드는 AI 도구(Anthropic Claude)를 활용해 작성되었습니다.
 
 ## 라이선스

@@ -1,6 +1,6 @@
 ﻿# ═══════════════════════════════════════════════════════════
 #  작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
-#  v1.0.4  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
+#  v1.0.5  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
 #  데이터: amae-koromo(雀魂牌谱屋) 공개 API — 게임에 개입하지 않음
 # ═══════════════════════════════════════════════════════════
 
@@ -41,6 +41,13 @@ $MaxPts = @{
 }
 $EpochStart = 1262304000000
 
+# 안정단위 모드별 상수 (amae-koromo 원본 데이터)
+$ModeNames = @{ 8 = '금동'; 9 = '금남'; 11 = '옥동'; 12 = '옥남'; 15 = '왕좌동'; 16 = '왕좌남' }
+$ModeDelta = @{ 8 = @(40, 20, 0, 0); 9 = @(80, 40, 0, 0); 11 = @(55, 30, 0, 0); 12 = @(110, 55, 0, 0); 15 = @(60, 30, 0, 0); 16 = @(120, 60, 0, 0) }
+$PenaltyS = @(0, 0, 0, 20, 40, 60, 80, 100, 120, 165, 180, 195, 210, 225, 240, 255)   # 남장 4위 페널티 (단위 인덱스)
+$PenaltyE = @(0, 0, 0, 10, 20, 30, 40, 50, 60, 80, 90, 100, 110, 120, 130, 140)       # 동장
+$EastModes = @(8, 11, 15)
+
 $script:CachedId = 0
 $script:TodayDate = $null
 $script:TodayCount = -1
@@ -70,8 +77,11 @@ $script:Settings = @{
     AnomOffMe = ''; AnomOffOpp = ''; AnomCMe = ''; AnomCOpp = ''
     DispOffMe = ''; DispOffOpp = ''
     UiScale = 1.0; SessionBase = 'today'; AnomPct = 20; BadgeDefs = ''; BadgeOn = $true
+    MyStableMode = 'auto'; OppStableMode = 'auto'; StableColors = ''; StableDual = $true; TextColor = ''
+    BgColor = ''; BgAlpha = -1
     MyBasis = 'm1'; OppBasis = 'm1'; KeyScan = 'F8'; KeyClose = 'F7'; KeyExit = 'F10'; DailyGoal = 0
 }
+$script:Presets = @{}     # 이름 -> @{ Theme; Settings }
 $script:OppCache = @{}    # id -> 전적 데이터
 $script:OppWindows = @{}  # id -> WPF 창
 
@@ -81,15 +91,24 @@ $script:OppWindows = @{}  # id -> WPF 창
 # GUI 프로세스에서만 $script:UiPump가 켜지고, 자식 프로세스(-ScanOnce/-ReportOnce/-DetailOnce)는 기존 동기 방식 그대로.
 function Invoke-UiPump {
     param([int]$Ms = 0)
-    $end = [DateTime]::UtcNow.AddMilliseconds($Ms)
-    do {
-        $frame = New-Object Windows.Threading.DispatcherFrame
+    # 수면 없이 디스패처 프레임을 타이머로 종료 - 대기 중에도 애니메이션·클릭이 완전히 살아 있음
+    # (이전 구현은 15ms Start-Sleep 루프라 긴 API 대기 시 UI가 얼어붙고 CPU를 태웠음)
+    $frame = New-Object Windows.Threading.DispatcherFrame
+    if ($Ms -le 0) {
         $null = [Windows.Threading.Dispatcher]::CurrentDispatcher.BeginInvoke(
             [Windows.Threading.DispatcherPriority]::Background,
             [action] { $frame.Continue = $false }.GetNewClosure())
         [Windows.Threading.Dispatcher]::PushFrame($frame)
-        if ([DateTime]::UtcNow -lt $end) { Start-Sleep -Milliseconds 15 }
-    } while ([DateTime]::UtcNow -lt $end)
+        return
+    }
+    $t = New-Object Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromMilliseconds([math]::Max(10, $Ms))
+    $t.Add_Tick({
+        $t.Stop()
+        $frame.Continue = $false
+    }.GetNewClosure())
+    $t.Start()
+    [Windows.Threading.Dispatcher]::PushFrame($frame)
 }
 
 function Wait-Api {
@@ -116,10 +135,12 @@ function Invoke-Api {
 }
 
 function Get-RangeStats {
-    param($Id, $StartMs, $EndMs)
+    param($Id, $StartMs, $EndMs, [string]$ModeFilter = '')
+    $mq = $script:Modes
+    if ($ModeFilter) { $mq = $ModeFilter }
     foreach ($try in 1..3) {
         try {
-            return Invoke-Api "$Api/player_stats/$Id/$StartMs/$EndMs`?mode=$($script:Modes)" 15
+            return Invoke-Api "$Api/player_stats/$Id/$StartMs/$EndMs`?mode=$mq" 15
         } catch {
             # 속도 제한(429/530) 대비 점진적 대기
             Wait-Api (500 * $try)
@@ -296,7 +317,7 @@ function Get-StatParts {
         @{ L = 3; K = 'dp'; V = [double]$Ext.'平均打点'; T = ('평균타점 {0:N0}' -f [double]$Ext.'平均打点') },
         @{ L = 3; K = 'dpl'; V = [double]$Ext.'平均铳点'; T = ('평균방총점 {0:N0}' -f [double]$Ext.'平均铳点') },
         @{ L = 3; K = 'tobi'; V = [double]$Stats.negative_rate; T = ('토비율 {0:P1}' -f [double]$Stats.negative_rate) },
-        @{ L = 3; K = 'wt'; V = [double]$Ext.'和了巡数'; T = ('평균화료순 {0:N2}' -f [double]$Ext.'和了巡数') },
+        @{ L = 5; K = 'wt'; V = [double]$Ext.'和了巡数'; T = ('평균화료순 {0:N2}' -f [double]$Ext.'和了巡数') },
         @{ L = 4; K = 'gs'; V = [double]$Ext.'立直好型'; T = ('우형리치율 {0:P1}' -f [double]$Ext.'立直好型') },
         @{ L = 4; K = 'gs2'; V = [double]$Ext.'立直好型2'; T = ('우형2 {0:P1}' -f [double]$Ext.'立直好型2') },
         @{ L = 4; K = 'sente'; V = [double]$Ext.'先制率'; T = ('선제리치율 {0:P1}' -f [double]$Ext.'先制率') }
@@ -376,27 +397,198 @@ function Get-BasisLabel {
     }
 }
 
-# Ported from amae-koromo — estimateStableLevel2()
+# 단일 모드(또는 그룹) 국수 조회 - 404는 기록 없음(0)으로 처리
+function Get-ModeCount {
+    param($Id, $StartMs, $EndMs, [string]$Mq)
+    foreach ($try in 1..2) {
+        try {
+            $r = Invoke-Api "$Api/player_stats/$Id/$StartMs/$EndMs`?mode=$Mq" 12
+            if ($r) { return [int]$r.count }
+            return 0
+        } catch {
+            $code = 0
+            try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+            if ($code -eq 404) { return 0 }
+            Wait-Api 500
+        }
+    }
+    return 0
+}
+
+# 그룹 내 남/동 세부 다수결 (남장 모드 id를 받아 남 또는 동 반환)
+function Get-SubMode {
+    param($Id, $StartMs, $EndMs, [int]$South)
+    $sc = Get-ModeCount $Id $StartMs $EndMs "$South"
+    $ec = Get-ModeCount $Id $StartMs $EndMs "$($South - 1)"
+    if ($ec -gt $sc) { return ($South - 1) }
+    return $South
+}
+
+# 화면 OCR 토큰에서 현재 방 감지 ('금탁·4인 동풍전' 등) → 모드 id, 실패 시 0
+function Get-RoomModeFromTokens {
+    param($Tokens)
+    $roomMap = @{ '금' = 9; '옥' = 12; '왕좌' = 16 }
+    foreach ($tk in $Tokens) {
+        $t = ([string]$tk.Text) -replace '\s', ''
+        # 비단위전(친선전·대회전 등): 방 개념 없음 → 각자 다수결로 처리
+        if ($t -match '(친선|대회|교류)전?') { return -1 }
+        if ($t -match '(금|옥|왕좌)탁') {
+            $grp = [string]$Matches[1]
+            if ($t -match '(동풍|반장)전') {
+                $isEastRoom = ([string]$Matches[1] -eq '동풍')
+                $south = [int]$roomMap[$grp]
+                if ($isEastRoom) { return ($south - 1) }
+                return $south
+            }
+        }
+    }
+    return 0
+}
+
+# 주력 모드 판별: 기준 구간의 그룹별 국수 비교(금/옥/왕좌 → 남/동)
+# (player_records 엔드포인트는 서버 측 차단이라 국수 다수결로 대체)
+function Get-DominantMode {
+    param($Id, $StartMs, $EndMs, [int]$LvlId = 0)
+    $cnt = {
+        param($mq)
+        foreach ($try in 1..2) {
+            try {
+                $r = Invoke-Api "$Api/player_stats/$Id/$StartMs/$EndMs`?mode=$mq" 12
+                if ($r) { return [int]$r.count }
+                return 0
+            } catch {
+                $code = 0
+                try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+                if ($code -eq 404) { return 0 }   # 해당 모드 기록 없음
+                Wait-Api 500
+            }
+        }
+        return 0
+    }
+    $gold = & $cnt '9.8'
+    $jade = & $cnt '12.11'
+    $throne = & $cnt '16.15'
+    $grp = ''
+    if ($gold -ge $jade -and $gold -ge $throne -and $gold -gt 0) { $grp = '9.8' }
+    elseif ($throne -ge $jade -and $throne -gt 0) { $grp = '16.15' }
+    elseif ($jade -gt 0) { $grp = '12.11' }
+    if (-not $grp) {
+        # 기록 없음: 단위 기반 폴백
+        $maj = ([int][math]::Floor($LvlId / 100)) % 100
+        switch ($maj) { 4 { return 12 } 5 { return 12 } 6 { return 16 } default { return 9 } }
+    }
+    $south = @{ '9.8' = 9; '12.11' = 12; '16.15' = 16 }[$grp]
+    $sc = & $cnt "$south"
+    $ec = & $cnt "$($south - 1)"
+    if ($ec -gt $sc) { return ($south - 1) }
+    return $south
+}
+
+# Based on amae-koromo — estimateStableLevel2()
 #   https://github.com/SAPikachu/amae-koromo
-#   Copyright (c) 2020 SAPikachu, MIT License — see LICENSE (third-party notices)
-# 안정단위 추정 (옥남 기준): 기대수지/(4위율*15) - 10
+#   Copyright (c) 2020 SAPikachu, MIT License — see THIRD-PARTY-NOTICES.txt
+#   (모드별 순위 보너스·4위 페널티 표 적용과 금탁·동장 연속값 확장은 자체 수정)
+# 안정단위 추정: 버틸 수 있는 4위 페널티 p = 기대수지/4위율 을 페널티 표로 역산 (작호1 = 1)
 function Get-StableLevel {
-    param($Stats)
+    param($Stats, [int]$ModeId = 12)
     $r = @($Stats.rank_rates)
     $s = @($Stats.rank_avg_score)
     if ($r.Count -lt 4 -or $s.Count -lt 4) { return $null }
-    if (-not $r[3]) { return @{ Val = 9.0; Text = '작성+' } }
+    $isEast = ($EastModes -contains $ModeId)
+    $pen = $PenaltyS
+    if ($isEast) { $pen = $PenaltyE }
+    $md = $ModeDelta[$ModeId]
+    if (-not $md) { $md = $ModeDelta[12] }
+    $isGold = ($ModeId -le 9)
+    if (-not $r[3]) {
+        $capTxt = '작성+'
+        if ($isGold) { $capTxt = '작호+' }
+        return @{ Val = 9.0; Text = $capTxt; E = 0.0; Pen = $pen }
+    }
     $uma = @(15, 5, -5, -15)
-    $md = @(110, 55, 0, 0)
     $e = 0.0
     for ($i = 0; $i -lt 4; $i++) {
         if ($null -eq $s[$i]) { continue }
         $d = [math]::Ceiling(($s[$i] - 25000) / 1000 + $uma[$i]) + $md[$i]
         $e += $r[$i] * $d
     }
-    $v = $e / ($r[3] * 15) - 10
-    if ($v -ge 4) { return @{ Val = $v; Text = ('작성{0:N2}' -f ($v - 3)) } }
-    return @{ Val = $v; Text = ('작호{0:N2}' -f $v) }
+    $p = $e / $r[3]
+    $step = 15.0
+    if ($isEast) { $step = 10.0 }
+    if ($ModeId -eq 12 -or $ModeId -eq 16) {
+        # 옥남/왕좌남: 기존·검색사이트와 동일한 폐형식 유지 (표시값 회귀 없음)
+        $v = $p / 15.0 - 10.0
+        if ($v -ge 4) { return @{ Val = $v; Text = ('작성{0:N2}' -f ($v - 3)); E = $e; Pen = $pen } }
+        return @{ Val = $v; Text = ('작호{0:N2}' -f $v); E = $e; Pen = $pen }
+    }
+    # 금탁·동장: 페널티 표가 불균일하므로 구간별 역산으로 연속값 확장
+    $v = -5.0
+    $floor = $false
+    if ($p -ge $pen[9]) {
+        $v = ($p - $pen[9]) / $step + 1.0
+    } else {
+        $matched = $false
+        for ($k = 8; $k -ge 3; $k--) {
+            if ($p -ge $pen[$k]) {
+                $v = ($k - 8) + (($p - $pen[$k]) / ($pen[$k + 1] - $pen[$k]))
+                $matched = $true
+                break
+            }
+        }
+        if (-not $matched) { $floor = $true }
+    }
+    $txt = ''
+    if ($floor) { $txt = '작사1-' }
+    elseif ($isGold -and $v -ge 4) { $txt = '작호+' }   # 금탁 단위 상한은 작호
+    elseif ($v -ge 4) { $txt = ('작성{0:N2}' -f ($v - 3)) }
+    elseif ($v -ge 1) { $txt = ('작호{0:N2}' -f $v) }
+    elseif ($v -ge -2) { $txt = ('작걸{0:N2}' -f ($v + 3)) }
+    else { $txt = ('작사{0:N2}' -f ($v + 6)) }
+    return @{ Val = $v; Text = $txt; E = $e; Pen = $pen }
+}
+
+# 안정단위 값 → 등급 구간 (색상용)
+function Get-StableTier {
+    param([double]$V)
+    if ($V -ge 4) { return 'seong' }
+    if ($V -ge 1) { return 'ho' }
+    if ($V -ge -2) { return 'geol' }
+    return 'sasa'
+}
+
+# 등급별 색상 (기본값 + 사용자 재정의 'sasa=#..,geol=#..' 형식)
+$script:StableTierDefaults = @{
+    sasa = '#FF7BE38B'    # 작사: 초록
+    geol = '#FFFFD666'    # 작걸: 노랑
+    ho = '#FFFF9800'      # 작호: 주황
+    seong = '#FFFF5544'   # 작성: 다홍
+    konten = '#FF80DEEA'  # 혼천: 하늘색
+    none = '#FF9AA3B6'    # 전적 부족: 회색
+}
+$script:StableTierNames = @{ sasa = '작사'; geol = '작걸'; ho = '작호'; seong = '작성'; konten = '혼천' }
+
+function Get-StableTierColor {
+    param([string]$Tier)
+    $ov = [string]$script:Settings.StableColors
+    if ($ov) {
+        foreach ($pair in @($ov -split ',' | Where-Object { $_ })) {
+            $kv = $pair -split '='
+            if ($kv.Count -ge 2 -and $kv[0] -eq $Tier -and $kv[1]) { return [string]$kv[1] }
+        }
+    }
+    if ($script:StableTierDefaults.ContainsKey($Tier)) { return $script:StableTierDefaults[$Tier] }
+    return '#FF7BE38B'
+}
+
+function Set-StableTierColor {
+    param([string]$Tier, [string]$Hex)
+    $m = @{}
+    foreach ($pair in @(([string]$script:Settings.StableColors) -split ',' | Where-Object { $_ })) {
+        $kv = $pair -split '='
+        if ($kv.Count -ge 2) { $m[$kv[0]] = $kv[1] }
+    }
+    $m[$Tier] = $Hex
+    $script:Settings.StableColors = (@($m.Keys | ForEach-Object { '{0}={1}' -f $_, $m[$_] }) -join ',')
 }
 
 # 시작점 + 게임별 (Lvl, Pt)로 누적 수지 시리즈 생성 (승단/강단 넘어도 이어짐)
@@ -797,11 +989,41 @@ function Get-OverlayData {
     $script:CurLvlId = $curLvl
     $rank = Get-RankLine -LvlId $curLvl -Cur $curPt -BasePt $displayBase
     $stable = $null
-    if (-not $emptyBasis) { $stable = Get-StableLevel $stats }
+    $domMode = 0
+    $modeStats = $null
+    $myMajNow = ([int][math]::Floor($curLvl / 100)) % 100
+    if ($myMajNow -ne 6 -and -not $emptyBasis) {
+        # 주력 모드 판별(10분 캐시) 후 그 모드 통계만으로 안정단위 계산
+        $manualMode = 0
+        if ([string]$script:Settings.MyStableMode -match '^\d+$') { $manualMode = [int]$script:Settings.MyStableMode }
+        if ($manualMode -gt 0) {
+            $domMode = $manualMode
+        } else {
+            $dmKey = ('{0}|{1}|{2}' -f $id, $script:Settings.MyBasis, $statStart)
+            if ($script:MyDomModeKey -eq $dmKey -and $script:MyDomModeAt -and ((Get-Date) - $script:MyDomModeAt).TotalMinutes -lt 10) {
+                $domMode = [int]$script:MyDomMode
+            } else {
+                $domMode = Get-DominantMode $id $statStart $nowPlus ([int]$curLvl)
+                $script:MyDomMode = $domMode
+                $script:MyDomModeKey = $dmKey
+                $script:MyDomModeAt = Get-Date
+            }
+        }
+        $modeStats = Get-RangeStats $id $statStart $nowPlus -ModeFilter "$domMode"
+        if (-not $modeStats -or -not $modeStats.count) { $modeStats = Get-RangeStats $id $EpochStart $nowPlus -ModeFilter "$domMode" }
+        if ($modeStats -and $modeStats.count) { $stable = Get-StableLevel $modeStats $domMode }
+    }
     $suffix = ''
     $myColorVal = $null
-    if ($stable) {
-        $suffix = '  안정 ' + $stable.Text + ' (' + (Get-BasisLabel $script:Settings.MyBasis) + ' 기준 · ' + $stats.count + '국)'
+    $myTier = ''
+    if ($myMajNow -eq 6) {
+        # 혼천은 별도 pt 체계라 안정단위 공식이 성립하지 않음
+        $suffix = '  안정 감히 계산할 수 없음 (혼천)'
+        $myColorVal = 9.0
+        $myTier = 'konten'
+    } elseif ($stable) {
+        $myTier = Get-StableTier ([double]$stable.Val)
+        $suffix = '  안정 ' + $stable.Text + ' (' + $ModeNames[$domMode] + '·' + (Get-BasisLabel $script:Settings.MyBasis) + ' 기준 · ' + $modeStats.count + '국)'
         $myColorVal = $stable.Val
     } elseif ($emptyBasis) {
         $suffix = '  ' + (Get-BasisLabel $script:Settings.MyBasis) + ' 기준 · 0국'
@@ -818,10 +1040,17 @@ function Get-OverlayData {
     if ($majC -lt 6 -and $MaxPts.ContainsKey($majC)) {
         $remain = $MaxPts[$majC][$minC - 1] - $curPt
         $goalLine = "승단까지 ${remain}pt"
-        $rates = @($stats.rank_rates)
-        if ($stable -and $rates.Count -ge 4 -and $rates[3]) {
-            $e = ($stable.Val + 10) * $rates[3] * 15   # 국당 기대수지 (옥남 근사)
-            if ($e -gt 0.5) { $goalLine += ' (약 {0}국)' -f [math]::Ceiling($remain / $e) }
+        if ($stable -and $modeStats) {
+            $mr = @($modeStats.rank_rates)
+            if ($mr.Count -ge 4 -and $mr[3]) {
+                # 국당 순수 기대수지 = 기대수지 - 4위율 * 현재 단위의 4위 페널티
+                $pidx = ($majC - 1) * 3 + ($minC - 1)
+                $penC = 0.0
+                $penArr = @($stable.Pen)
+                if ($pidx -ge 0 -and $pidx -lt $penArr.Count) { $penC = [double]$penArr[$pidx] }
+                $eNet = [double]$stable.E - ([double]$mr[3] * $penC)
+                if ($eNet -gt 0.5) { $goalLine += ' (약 {0}국)' -f [math]::Ceiling($remain / $eNet) }
+            }
         }
     }
     $dGoal = [int]$script:Settings.DailyGoal
@@ -839,6 +1068,7 @@ function Get-OverlayData {
         NameSuffix = $suffix
         Badges = $myBadges
         NameColorVal = $myColorVal
+        StableTier = $myTier
         RankLine = $rank.Text
         Diff     = $todayDiff
         NoDiff   = $rank.NoDiff
@@ -859,7 +1089,7 @@ function Get-OverlayData {
 }
 
 function Get-OpponentData {
-    param($Id)
+    param($Id, [switch]$SkipStable)
     if ($script:OppCache.ContainsKey("$Id")) { return $script:OppCache["$Id"] }
     $nowPlus = [DateTimeOffset]::UtcNow.AddHours(2).ToUnixTimeMilliseconds()
     $oppBasis = [string]$script:Settings.OppBasis
@@ -897,22 +1127,116 @@ function Get-OpponentData {
     $effOpp = Get-EffectiveLevel $fullStats.level
     $rank = Get-RankLine -LvlId ([int]$effOpp.Id) -Cur ([int]$effOpp.Pt) -BasePt $null
     $statParts = Get-StatParts $stats $ext
-    $stable = Get-StableLevel $stats
+    # 안정단위: 방(금/옥/왕좌 감지) 인지형 표시 (결과는 OppCache에 통째로 캐시됨)
+    # -SkipStable: 박스를 먼저 띄우기 위한 1차 데이터 - 안정단은 2차에서 채움
+    $oppMajNow = ([int][math]::Floor([int]$effOpp.Id / 100)) % 100
     $suffix = ''
+    $suffix2 = ''
     $colorVal = $null
-    if ($stable) {
-        $bLabel = Get-BasisLabel $finalBasis
-        if ($finalBasis -ne $oppBasis) { $bLabel = (Get-BasisLabel $oppBasis) + '→' + $bLabel }
-        $suffix = '  안정 ' + $stable.Text + ' (' + $bLabel + ' 기준 · ' + $stats.count + '국)'
-        $colorVal = $stable.Val
+    $oppTier = ''
+    if (-not $SkipStable) {
+    $bLabel = Get-BasisLabel $finalBasis
+    if ($finalBasis -ne $oppBasis) { $bLabel = (Get-BasisLabel $oppBasis) + '→' + $bLabel }
+    # 한 모드의 (통계, 안정단, 국수) 묶음
+    $calc = {
+        param([int]$m)
+        $ms = Get-RangeStats $Id $statStart $nowPlus -ModeFilter "$m"
+        if (-not $ms -or -not $ms.count) { $ms = Get-RangeStats $Id $EpochStart $nowPlus -ModeFilter "$m" }
+        $st2 = $null
+        if ($ms -and $ms.count) { $st2 = Get-StableLevel $ms $m }
+        return @{ M = $m; N = $(if ($ms) { [int]$ms.count } else { 0 }); S = $st2 }
+    }
+    if ($oppMajNow -eq 6) {
+        # 혼천은 별도 pt 체계라 안정단위 공식이 성립하지 않음
+        $suffix = '  안정 감히 계산할 수 없음 (혼천)'
+        $colorVal = 9.0
+        $oppTier = 'konten'
+    } elseif ([string]$script:Settings.OppStableMode -match '^\d+$') {
+        # 수동 고정 모드
+        $r1 = & $calc ([int]$script:Settings.OppStableMode)
+        if ($r1.S) {
+            $suffix = '  안정 ' + $r1.S.Text + ' (' + $ModeNames[$r1.M] + '·' + $bLabel + ' 기준 · ' + $r1.N + '국)'
+            $colorVal = $r1.S.Val
+            $oppTier = Get-StableTier ([double]$r1.S.Val)
+        }
+    } else {
+        # 방 결정: OCR 감지 > 내 주력 기반 추정
+        # (관전처럼 내가 없는 탁자에서는 내 기반 추정을 쓰지 않음 - 각자 다수결로)
+        $room = [int]$script:ScanRoomMode
+        $roomOcr = ($room -gt 0)
+        if ($room -lt 0) { $room = 0 }   # 비단위전(친선전 등): 방 없음 - 개인별 다수결
+        elseif (-not $room -and $script:RoomGuess -and $script:SawMyNick) { $room = [int]$script:RoomGuess }
+        # 상대 단위로 보정 (입장 범위: 작사=동·은, 작걸=은·금, 작호=금·옥, 작성=옥·왕, 혼천=왕):
+        #  - OCR 확정 방: 입장 불가능한 단위만 보정 (금탁에 작성·혼천 불가, 옥탁에 작걸 이하 불가, 왕좌탁에 작호 이하 불가)
+        #  - 추정 방: 작호부터 옥탁 기본 취급
+        if ($room) {
+            $isEastRoom = ($EastModes -contains $room)
+            $goldCut = 5
+            if (-not $roomOcr) { $goldCut = 4 }
+            $newSouth = 0
+            if ($room -le 9 -and $oppMajNow -ge $goldCut) { $newSouth = $(if ($oppMajNow -ge 6) { 16 } else { 12 }) }
+            elseif ($room -ge 11 -and $room -le 12 -and $oppMajNow -le 3) { $newSouth = 9 }
+            elseif ($room -ge 15 -and $oppMajNow -le 4) { $newSouth = 12 }
+            if ($newSouth) {
+                $room = $newSouth
+                if ($isEastRoom) { $room = $newSouth - 1 }
+            }
+        }
+        $goldN = Get-ModeCount $Id $statStart $nowPlus '9.8'
+        $jadeN = Get-ModeCount $Id $statStart $nowPlus '12.11'
+        $pri = $null; $sec = $null
+        if ($room -ge 8 -and $room -le 9) {
+            # 금탁: 기본은 금 기준. 금 20국 이하면 전적 부족(회색), 옥 20국+면 옥 기준 병행(금캉스 구분)
+            if ($goldN -gt 20) { $pri = & $calc (Get-SubMode $Id $statStart $nowPlus 9) }
+            if ($script:Settings.StableDual -and $jadeN -ge 20) { $sec = & $calc (Get-SubMode $Id $statStart $nowPlus 12) }
+            if (-not $pri -and -not $sec) {
+                $suffix = '  안정 전적 부족 (금탁 ' + $goldN + '국)'
+                $oppTier = 'none'
+                $colorVal = 0.0
+            }
+        } elseif ($room -ge 11 -and $room -le 12) {
+            # 옥탁: 옥 20국+면 옥 기준, 아니면 금 기준 폴백, 그것도 부족하면 전적 부족
+            if ($jadeN -ge 20) { $pri = & $calc (Get-SubMode $Id $statStart $nowPlus 12) }
+            elseif ($goldN -gt 20) { $pri = & $calc (Get-SubMode $Id $statStart $nowPlus 9) }
+            else {
+                $suffix = '  안정 전적 부족 (옥 ' + $jadeN + '국·금 ' + $goldN + '국)'
+                $oppTier = 'none'
+                $colorVal = 0.0
+            }
+        } else {
+            # 왕좌탁 또는 방 미감지: 기존 다수결
+            $dm = Get-DominantMode $Id $statStart $nowPlus ([int]$effOpp.Id)
+            $pri = & $calc $dm
+        }
+        if (-not $suffix) {
+            $parts = @()
+            $best = $null
+            foreach ($rr in @($pri, $sec)) {
+                if ($rr -and $rr.S) {
+                    $parts += ('안정 ' + $rr.S.Text + ' (' + $ModeNames[$rr.M] + '·' + $rr.N + '국·' + $bLabel + ' 기준)')
+                    $best = $rr
+                }
+            }
+            if ($parts.Count -gt 0) {
+                # 병행(금+옥)은 가로 폭이 넓어지지 않도록 두 줄로
+                $suffix = '  ' + $parts[0]
+                if ($parts.Count -gt 1) { $suffix2 = '  ' + $parts[1] }
+                # 색상은 실질 실력(옥 기준이 있으면 옥) 기준
+                $colorVal = $best.S.Val
+                $oppTier = Get-StableTier ([double]$best.S.Val)
+            }
+        }
+    }
     }
     $badges = Get-StyleBadges $fullStats $ext
     $gameLine = '전적 {0}국  평균순위 {1:N2}' -f $stats.count, $stats.avg_rank
     $d = [pscustomobject]@{
         Name     = $stats.nickname
         NameSuffix = $suffix
+        NameSuffix2 = $suffix2
         Badges = $badges
         NameColorVal = $colorVal
+        StableTier = $oppTier
         RankLine = $rank.Text
         Diff     = $rank.Diff
         NoDiff   = $rank.NoDiff
@@ -1811,6 +2135,7 @@ function Scan-Opponents {
     $script:ScanQueryLeft = 60   # 스캔 1회당 최대 조회 수 (속도 제한 방지)
     $script:SkipRects = @()
     $script:SawMyNick = $false
+    $script:ScanRoomMode = 0
     $script:ScanOnProgress = $OnProgress   # 매칭 확정 즉시 1명씩 알림 (Notify-NewFound)
     $found = @{}
     $deadline = (Get-Date).AddSeconds(990)   # 부모의 안전망(999초)보다 조금 먼저 스스로 종료
@@ -1835,6 +2160,7 @@ function Scan-Opponents {
             $rf = Join-Path $PSScriptRoot 'scan-box.json'
             if ((Test-Path $rf) -and ((Get-Date) - (Get-Item $rf).LastWriteTime).TotalMinutes -lt 5) {
                 $bx = Get-Content $rf -Raw | ConvertFrom-Json
+                if ($null -ne $bx.Room) { $script:RoomGuess = [int]$bx.Room }
                 foreach ($b in (@($bx) + @($bx.Opp))) {
                     if ($b -and [double]$b.W -gt 0 -and [double]$b.H -gt 0) {
                         $script:SkipRects += @{
@@ -1853,6 +2179,10 @@ function Scan-Opponents {
                 # Paddle 엔진: 전체+명패를 한 번에 (빠르고 신뢰도 필터 내장)
                 $pt = Get-PaddleTokens $bmp
                 $null = $script:ScanLog.Add("--- Paddle 스캔 (토큰 $($pt.Count)개)")
+                if (-not $script:ScanRoomMode) {
+                    $script:ScanRoomMode = Get-RoomModeFromTokens $pt
+                    if ($script:ScanRoomMode) { $null = $script:ScanLog.Add("--- 방 감지: $($ModeNames[$script:ScanRoomMode])") }
+                }
                 if ($pt.Count -eq 0) {
                     # 엔진이 연속으로 빈손이면 고장으로 보고 Windows OCR로 전환
                     $script:PaddleFails++
@@ -1881,6 +2211,10 @@ function Scan-Opponents {
                 }
             }
             $fullT = Get-FullTokens $bmp
+            if (-not $script:ScanRoomMode) {
+                $script:ScanRoomMode = Get-RoomModeFromTokens $fullT
+                if ($script:ScanRoomMode) { $null = $script:ScanLog.Add("--- 방 감지: $($ModeNames[$script:ScanRoomMode])") }
+            }
             $isRankScreen = (@($fullT | Where-Object { ($_.Text -replace '\s', '') -match '^[1-4](위|位)(?!\d+(국|局))' }).Count -gt 0)
             if ($isRankScreen) {
                 # 순위 화면(패보/결과 목록): 명패 밴드 무의미 - 순위 목록만 처리
@@ -1998,18 +2332,20 @@ if ($args -contains '-ScanOnce') {
         $pos = Get-Content (Join-Path $PSScriptRoot 'overlay-pos.json') -Raw | ConvertFrom-Json
         if ($pos.Settings.OppBasis) { $script:Settings.OppBasis = [string]$pos.Settings.OppBasis }
         if ($pos.Settings.Stable -is [bool]) { $script:Settings.Stable = $pos.Settings.Stable }
+        if ($pos.Settings.OppStableMode) { $script:Settings.OppStableMode = [string]$pos.Settings.OppStableMode }
+        if ($pos.Settings.StableDual -is [bool]) { $script:Settings.StableDual = $pos.Settings.StableDual }
         if ($pos.Settings.Nickname) { $script:Nickname = [string]$pos.Settings.Nickname }
         if ($null -ne $pos.Settings.OppMinN) { $script:Settings.OppMinN = [int]$pos.Settings.OppMinN }
     } catch {}
     $resPath = Join-Path $PSScriptRoot 'scan-result.json'
     $dataCache = @{}
-    # 찾은 상대들의 데이터를 조회해 즉시 저장 - 스캔 도중 중지/강제 종료돼도 여기까지의 상대는 표시됨
+    # 1차: 안정단위 없이 빠르게 조회해 즉시 표시 (사람 먼저) - 중지/강제 종료돼도 여기까지는 표시됨
     $saveOpps = {
         param($Opps)
         $out = @()
         foreach ($o in $Opps) {
             $key = "$($o.Id)"
-            if (-not $dataCache[$key]) { $dataCache[$key] = Get-OpponentData $o.Id }
+            if (-not $dataCache[$key]) { $dataCache[$key] = Get-OpponentData $o.Id -SkipStable }
             if ($dataCache[$key]) {
                 $out += [pscustomobject]@{ Id = $key; X = [double]$o.X; Y = [double]$o.Y; Data = $dataCache[$key] }
             }
@@ -2018,6 +2354,15 @@ if ($args -contains '-ScanOnce') {
     }
     $opps = Scan-Opponents -OnProgress $saveOpps
     & $saveOpps $opps
+    # 2차: 안정단위를 채워 한 명씩 갱신 (박스가 제자리에서 업데이트됨)
+    foreach ($o in $opps) {
+        $key = "$($o.Id)"
+        $full = Get-OpponentData $o.Id
+        if ($full) {
+            $dataCache[$key] = $full
+            & $saveOpps $opps
+        }
+    }
     exit 0
 }
 $riIdx = [Array]::IndexOf($args, '-ReportOnce')
@@ -2103,6 +2448,7 @@ $BoxXaml = @'
         <TextBlock x:Name="TbStat2" FontFamily="Malgun Gothic" FontSize="15" FontWeight="Bold" Foreground="#FF16213E"/>
         <TextBlock x:Name="TbStat3" FontFamily="Malgun Gothic" FontSize="15" FontWeight="Bold" Foreground="#FF16213E"/>
         <TextBlock x:Name="TbStat4" FontFamily="Malgun Gothic" FontSize="15" FontWeight="Bold" Foreground="#FF16213E"/>
+        <TextBlock x:Name="TbStat5" FontFamily="Malgun Gothic" FontSize="15" FontWeight="Bold" Foreground="#FF16213E"/>
         <Canvas x:Name="SparkCanvas" Height="34" Margin="0,7,0,0" Visibility="Collapsed" ClipToBounds="True"/>
         <TextBlock x:Name="TbHelp" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E"
                    Opacity="0.85" Margin="0,6,0,0" Visibility="Collapsed"/>
@@ -2128,6 +2474,9 @@ $BoxXaml = @'
           <CheckBox x:Name="CbBadge" Content="스타일 배지" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" Margin="0,1,0,1"/>
           <TextBlock x:Name="BtnBadgeAdv" Text="   고급 설정 ▾" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.85" Margin="16,2,0,1" Cursor="Hand"/>
           <StackPanel x:Name="BadgePanel" Margin="16,2,0,4" Visibility="Collapsed"/>
+          <CheckBox x:Name="CbStableOn" Content="안정단위" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" Margin="0,1,0,1"/>
+          <TextBlock x:Name="BtnStableAdv" Text="   고급 설정 ▾" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.85" Margin="16,2,0,1" Cursor="Hand"/>
+          <StackPanel x:Name="StablePanel" Margin="16,2,0,4" Visibility="Collapsed"/>
           <TextBlock x:Name="TbShowL" Text="── 표시 항목 ──" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.7" Margin="0,6,0,2"/>
           <StackPanel x:Name="DispPanel" Margin="0,0,0,2"/>
           <StackPanel Orientation="Horizontal" Margin="0,4,0,1">
@@ -2198,6 +2547,30 @@ $BoxXaml = @'
             <TextBlock x:Name="TbPosL" Text="박스 위치 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
             <TextBlock x:Name="BtnPosReset" Text="내 프로필 위로 되돌리기" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E"
                        VerticalAlignment="Center" Cursor="Hand" TextDecorations="Underline" Opacity="0.85"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
+            <TextBlock x:Name="TbTxtColL" Text="기본 글자색 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
+            <Border x:Name="SwTxtCol" Width="20" Height="16" CornerRadius="3" BorderThickness="1" BorderBrush="#88888888" Cursor="Hand"/>
+            <TextBlock x:Name="BtnTxtColReset" Text=" 테마 기본" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.8" VerticalAlignment="Center" Cursor="Hand" Padding="8,0,0,0" TextDecorations="Underline"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
+            <TextBlock x:Name="TbBgColL" Text="배경색 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
+            <Border x:Name="SwBgCol" Width="20" Height="16" CornerRadius="3" BorderThickness="1" BorderBrush="#88888888" Cursor="Hand"/>
+            <TextBlock x:Name="BtnBgColReset" Text=" 테마 기본" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.8" VerticalAlignment="Center" Cursor="Hand" Padding="8,0,0,0" TextDecorations="Underline"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
+            <TextBlock x:Name="TbBgAlphaL" Text="배경 투명도 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
+            <ComboBox x:Name="CmbBgAlpha" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
+          </StackPanel>
+          <TextBlock x:Name="TbPresetL" Text="── 프리셋 (테마·설정 전체 저장) ──" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.7" Margin="0,7,0,2"/>
+          <StackPanel Orientation="Horizontal" Margin="0,1,0,1">
+            <TextBox x:Name="TxPreset" FontFamily="Malgun Gothic" FontSize="12" Width="120" VerticalContentAlignment="Center" ToolTip="프리셋 이름"/>
+            <TextBlock x:Name="BtnPresetSave" Text=" 저장" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Cursor="Hand" Padding="8,0,0,0"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,1,0,1">
+            <ComboBox x:Name="CmbPreset" FontFamily="Malgun Gothic" FontSize="12" Width="120"/>
+            <TextBlock x:Name="BtnPresetLoad" Text=" 불러오기" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Cursor="Hand" Padding="8,0,0,0"/>
+            <TextBlock x:Name="BtnPresetDel" Text=" 삭제" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.75" VerticalAlignment="Center" Cursor="Hand" Padding="8,0,0,0"/>
           </StackPanel>
           <TextBlock x:Name="TbSrcL" Text="── 전적 검색 사이트 / 자료 출처 ──" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.7" Margin="0,7,0,2"/>
           <TextBlock x:Name="LnkSource" Text="https://amae-koromo.sapk.ch/" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF16213E" Opacity="0.85"
@@ -2379,6 +2752,7 @@ function New-StatWindow {
         TbStat2 = $w.FindName('TbStat2')
         TbStat3 = $w.FindName('TbStat3')
         TbStat4 = $w.FindName('TbStat4')
+        TbStat5 = $w.FindName('TbStat5')
         TbHelp = $w.FindName('TbHelp')
         SparkCanvas = $w.FindName('SparkCanvas')
         CtrlPanel = $w.FindName('CtrlPanel')
@@ -2406,6 +2780,9 @@ function New-StatWindow {
         CbBadge = $w.FindName('CbBadge')
         BtnBadgeAdv = $w.FindName('BtnBadgeAdv')
         BadgePanel = $w.FindName('BadgePanel')
+        CbStableOn = $w.FindName('CbStableOn')
+        BtnStableAdv = $w.FindName('BtnStableAdv')
+        StablePanel = $w.FindName('StablePanel')
         TbBasisMyL = $w.FindName('TbBasisMyL')
         TbBasisOppL = $w.FindName('TbBasisOppL')
         TbBasisWarn = $w.FindName('TbBasisWarn')
@@ -2433,6 +2810,20 @@ function New-StatWindow {
         TxNick = $w.FindName('TxNick')
         BtnNickApply = $w.FindName('BtnNickApply')
         TbSrcL = $w.FindName('TbSrcL')
+        TbTxtColL = $w.FindName('TbTxtColL')
+        TbBgColL = $w.FindName('TbBgColL')
+        SwBgCol = $w.FindName('SwBgCol')
+        BtnBgColReset = $w.FindName('BtnBgColReset')
+        TbBgAlphaL = $w.FindName('TbBgAlphaL')
+        CmbBgAlpha = $w.FindName('CmbBgAlpha')
+        SwTxtCol = $w.FindName('SwTxtCol')
+        BtnTxtColReset = $w.FindName('BtnTxtColReset')
+        TbPresetL = $w.FindName('TbPresetL')
+        TxPreset = $w.FindName('TxPreset')
+        BtnPresetSave = $w.FindName('BtnPresetSave')
+        CmbPreset = $w.FindName('CmbPreset')
+        BtnPresetLoad = $w.FindName('BtnPresetLoad')
+        BtnPresetDel = $w.FindName('BtnPresetDel')
         LnkSource = $w.FindName('LnkSource')
     }
     foreach ($cmb in @($box.CmbKeyScan, $box.CmbKeyClose, $box.CmbKeyExit)) {
@@ -2515,8 +2906,8 @@ function New-StatWindow {
     $box.BtnSettings.Add_MouseLeftButtonDown({
         $args[1].Handled = $true
         $b = $args[0].Tag
-        if ($b.SettingsPanel.Visibility -eq 'Visible') {
-            $b.SettingsPanel.Visibility = 'Collapsed'
+        if ($script:SettingsWin -and $script:SettingsWin.IsVisible) {
+            $script:SettingsWin.Hide()
         } else {
             $script:SyncingUI = $true
             $b.CbToast.IsChecked = [bool]$script:Settings.Toast
@@ -2545,10 +2936,30 @@ function New-StatWindow {
             if ($si -lt 0) { $si = 3 }
             $b.CmbScale.SelectedIndex = $si
             $b.CbBadge.IsChecked = [bool]$script:Settings.BadgeOn
+            $b.CbStableOn.IsChecked = [bool]$script:Settings.Stable
             $script:SyncingUI = $false
             Sync-SettingSections
+            Sync-TxtColSwatch
+            Sync-PresetList $b
             if ($b.BadgePanel.Visibility -eq 'Visible') { Build-BadgePanel $b }
-            $b.SettingsPanel.Visibility = 'Visible'
+            if ($script:SettingsWin) {
+                # 메인 박스 오른쪽에 붙여 표시 (화면 밖이면 왼쪽)
+                $mw = $b.Win
+                $script:SettingsWin.Left = $mw.Left + $mw.ActualWidth + 8
+                $script:SettingsWin.Top = $mw.Top
+                $script:SettingsWin.Show()
+                $script:SettingsWin.UpdateLayout()
+                $vw = [Windows.SystemParameters]::VirtualScreenWidth
+                if ($script:SettingsWin.Left + $script:SettingsWin.ActualWidth -gt $vw) {
+                    $script:SettingsWin.Left = [math]::Max(0, $mw.Left - $script:SettingsWin.ActualWidth - 8)
+                }
+                $vh = [Windows.SystemParameters]::VirtualScreenHeight
+                if ($script:SettingsWin.Top + $script:SettingsWin.ActualHeight -gt $vh) {
+                    $script:SettingsWin.Top = [math]::Max(0, $vh - $script:SettingsWin.ActualHeight - 8)
+                }
+            } else {
+                $b.SettingsPanel.Visibility = 'Visible'
+            }
         }
     })
     # 체크박스 토글 → 설정 저장 + 즉시 반영 (설정 키는 Tag에 저장)
@@ -2556,6 +2967,7 @@ function New-StatWindow {
     $box.CbMortal.Tag = 'MortalWatch'
     $box.CbAnom.Tag = 'Anom'
     $box.CbBadge.Tag = 'BadgeOn'
+    $box.CbStableOn.Tag = 'Stable'
     $cbHandler = {
         $s = $args[0]
         $script:Settings[[string]$s.Tag] = [bool]$s.IsChecked
@@ -2563,7 +2975,7 @@ function New-StatWindow {
         Sync-SettingSections
         Refresh-Display
     }
-    foreach ($cb in @($box.CbToast, $box.CbMortal, $box.CbAnom, $box.CbBadge)) {
+    foreach ($cb in @($box.CbToast, $box.CbMortal, $box.CbAnom, $box.CbBadge, $box.CbStableOn)) {
         $cb.Add_Click($cbHandler)
     }
     # 첫 실행 닉네임 입력 (확인 버튼 또는 Enter)
@@ -2717,6 +3129,110 @@ function New-StatWindow {
             Save-Pos
         })
     }
+    # 기본 글자색 변경/초기화
+    $box.SwTxtCol.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $cur = [string]$script:Settings.TextColor
+        if (-not $cur) { $cur = '#FFD9DCE1' }
+        Show-ColorPicker $args[0] $cur {
+            param($hex)
+            $script:Settings.TextColor = $hex
+            Save-Pos
+            foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
+            Sync-TxtColSwatch
+        }
+    })
+    $box.BtnTxtColReset.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $script:Settings.TextColor = ''
+        Save-Pos
+        foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
+        Sync-TxtColSwatch
+    })
+    # 배경색 변경/초기화 + 투명도
+    $box.SwBgCol.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $cur = [string]$script:Settings.BgColor
+        if (-not $cur) { $cur = '#FF1C2233' }
+        Show-ColorPicker $args[0] $cur {
+            param($hex)
+            $script:Settings.BgColor = $hex
+            Save-Pos
+            foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
+            Sync-TxtColSwatch
+        }
+    })
+    $box.BtnBgColReset.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $script:Settings.BgColor = ''
+        Save-Pos
+        foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
+        Sync-TxtColSwatch
+    })
+    foreach ($ba in $script:BgAlphaOptions) {
+        if ($ba -lt 0) { $null = $box.CmbBgAlpha.Items.Add('테마 기본') }
+        else { $null = $box.CmbBgAlpha.Items.Add("$ba%") }
+    }
+    $box.CmbBgAlpha.Add_SelectionChanged({
+        if ($script:SyncingUI) { return }
+        $c = $args[0]
+        if ($c.SelectedIndex -lt 0) { return }
+        $script:Settings.BgAlpha = [int]$script:BgAlphaOptions[$c.SelectedIndex]
+        Save-Pos
+        foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
+    })
+    # 프리셋 저장/불러오기/삭제
+    $box.BtnPresetSave.Tag = $box
+    $box.BtnPresetSave.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $b = $args[0].Tag
+        $nm = ([string]$b.TxPreset.Text).Trim()
+        if (-not $nm) { Show-Toast '프리셋 이름을 입력하세요' $false; return }
+        $snap = @{}
+        foreach ($k in @($script:Settings.Keys)) { $snap[$k] = $script:Settings[$k] }
+        $script:Presets[$nm] = @{ Theme = $script:Theme; Settings = $snap }
+        Save-Pos
+        Sync-PresetList $b
+        Show-Toast "프리셋 '$nm' 저장됨 ✓" $true
+    })
+    $box.BtnPresetLoad.Tag = $box
+    $box.BtnPresetLoad.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $b = $args[0].Tag
+        if ($b.CmbPreset.SelectedIndex -lt 0) { return }
+        $nm = [string]$b.CmbPreset.SelectedItem
+        $pr = $script:Presets[$nm]
+        if (-not $pr) { return }
+        foreach ($k in @($pr.Settings.Keys)) { $script:Settings[$k] = $pr.Settings[$k] }
+        if ($pr.Theme) { $script:Theme = [string]$pr.Theme }
+        $script:Nickname = [string]$script:Settings.Nickname
+        Save-Pos
+        foreach ($bb in Get-AllBoxes) { if ($bb) { Apply-Theme $bb } }
+        Apply-ScaleAll
+        Sync-SettingSections
+        Sync-TxtColSwatch
+        Refresh-Display
+        Update-HelpTexts
+        $script:OppCache = @{}
+        $script:MyDomModeKey = $null
+        Show-Toast "프리셋 '$nm' 적용됨 ✓" $true
+        # 열린 설정 UI 값 재동기화를 위해 창을 닫음 (다시 열면 새 값)
+        if ($script:SettingsWin) { $script:SettingsWin.Hide() }
+        Update-Overlay
+    })
+    $box.BtnPresetDel.Tag = $box
+    $box.BtnPresetDel.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $b = $args[0].Tag
+        if ($b.CmbPreset.SelectedIndex -lt 0) { return }
+        $nm = [string]$b.CmbPreset.SelectedItem
+        $ans = [Windows.MessageBox]::Show($script:SettingsWin, "프리셋 '$nm'을(를) 삭제할까요?", '프리셋 삭제', 'YesNo', 'Question')
+        if ($ans -ne 'Yes') { return }
+        $script:Presets.Remove($nm)
+        Save-Pos
+        Sync-PresetList $b
+        Show-Toast "프리셋 '$nm' 삭제됨" $false
+    })
     # 박스 크기 변경
     $box.CmbScale.Add_SelectionChanged({
         if ($script:SyncingUI) { return }
@@ -2735,6 +3251,20 @@ function New-StatWindow {
         } else {
             Build-BadgePanel $b
             $b.BadgePanel.Visibility = 'Visible'
+            $args[0].Text = '   고급 설정 ▴'
+        }
+    })
+    # 안정단위 고급 설정 펼치기/접기
+    $box.BtnStableAdv.Tag = $box
+    $box.BtnStableAdv.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $b = $args[0].Tag
+        if ($b.StablePanel.Visibility -eq 'Visible') {
+            $b.StablePanel.Visibility = 'Collapsed'
+            $args[0].Text = '   고급 설정 ▾'
+        } else {
+            Build-StablePanel $b
+            $b.StablePanel.Visibility = 'Visible'
             $args[0].Text = '   고급 설정 ▴'
         }
     })
@@ -2764,15 +3294,39 @@ function Apply-Theme {
         'trans' { $bg = '#01000000'; $fg = '#FFFFFFFF'; $shadow = $true }
         default { $bg = '#C7FFFFFF'; $fg = '#FF16213E'; $shadow = $false }
     }
+    # 사용자 지정 기본 글자색 (설정 시 테마 기본을 대체)
+    if ([string]$script:Settings.TextColor) { $fg = [string]$script:Settings.TextColor }
+    # 사용자 지정 배경색/투명도 (각각 독립 - 미설정 부분은 테마 기본 유지)
+    $bgc = [string]$script:Settings.BgColor
+    $bga = [int]$script:Settings.BgAlpha
+    if ($bgc -or $bga -ge 0) {
+        try {
+            $base = [Windows.Media.ColorConverter]::ConvertFromString($bg)
+            $rgb = $base
+            if ($bgc) { $rgb = [Windows.Media.ColorConverter]::ConvertFromString($bgc) }
+            $a = $base.A
+            if ($bga -ge 0) { $a = [byte][math]::Round(255.0 * $bga / 100.0) }
+            $bg = ('#{0:X2}{1:X2}{2:X2}{3:X2}' -f $a, $rgb.R, $rgb.G, $rgb.B)
+        } catch {}
+    }
     $Box.RootBorder.Background = New-Brush $bg
-    foreach ($tb in @($Box.TbName, $Box.TbRank, $Box.TbGoal, $Box.TbGame, $Box.TbStat, $Box.TbStat2, $Box.TbStat3, $Box.TbStat4, $Box.TbHelp,
+    if ($Box.SetRoot) {
+        $setBg = '#F5202433'
+        if ($script:Theme -eq 'light') { $setBg = '#F8FFFFFF' }
+        $Box.SetRoot.Background = New-Brush $setBg
+        $Box.SetTitle.Foreground = New-Brush $fg
+        $Box.SetClose.Foreground = New-Brush $fg
+    }
+    foreach ($tb in @($Box.TbName, $Box.TbRank, $Box.TbGoal, $Box.TbGame, $Box.TbStat, $Box.TbStat2, $Box.TbStat3, $Box.TbStat4, $Box.TbStat5, $Box.TbHelp,
                       $Box.BtnHelp, $Box.BtnSettings, $Box.BtnTheme, $Box.BtnReport, $Box.BtnScan, $Box.BtnCloseOpp,
                       $Box.CbToast, $Box.CbMortal, $Box.CbAnom,
                       $Box.TbBasisMyL, $Box.TbBasisOppL, $Box.TbBasisWarn, $Box.BtnRefresh,
                       $Box.TbKeyScanL, $Box.TbKeyCloseL, $Box.TbKeyExitL, $Box.TbGoalL, $Box.TbBaseL, $Box.TbMinNL, $Box.TbScaleL, $Box.TbShowL, $Box.TbNickL, $Box.BtnNickApply,
                       $Box.TbPosL, $Box.BtnPosReset,
-                      $Box.TbSetupL, $Box.BtnSetupApply, $Box.TbAnomModeL, $Box.TbAnomHighL, $Box.TbAnomLowL, $Box.TbAnomPctL, $Box.BtnAdv, $Box.CbBadge, $Box.BtnBadgeAdv,
-                      $Box.TbShowL, $Box.TbSrcL, $Box.LnkSource)) {
+                      $Box.TbSetupL, $Box.BtnSetupApply, $Box.TbAnomModeL, $Box.TbAnomHighL, $Box.TbAnomLowL, $Box.TbAnomPctL, $Box.BtnAdv, $Box.CbBadge, $Box.BtnBadgeAdv, $Box.CbStableOn, $Box.BtnStableAdv,
+                      $Box.TbShowL, $Box.TbSrcL, $Box.LnkSource,
+                      $Box.TbTxtColL, $Box.BtnTxtColReset, $Box.TbBgColL, $Box.BtnBgColReset, $Box.TbBgAlphaL,
+                      $Box.TbPresetL, $Box.BtnPresetSave, $Box.BtnPresetLoad, $Box.BtnPresetDel)) {
         if ($tb) { $tb.Foreground = New-Brush $fg }
     }
     if ($shadow) {
@@ -2804,8 +3358,8 @@ function Switch-Theme {
 function Save-Pos {
     $script:Settings.Nickname = $script:Nickname   # 닉네임은 항상 설정 파일에 보존 (백그라운드 프로세스가 읽음)
     @{ Left = $script:MyBox.Win.Left; Top = $script:MyBox.Win.Top; PosVer = $script:PosVer
-       Theme = $script:Theme; Settings = $script:Settings } |
-        ConvertTo-Json | Out-File $script:PosFile -Encoding utf8
+       Theme = $script:Theme; Settings = $script:Settings; Presets = $script:Presets } |
+        ConvertTo-Json -Depth 6 | Out-File $script:PosFile -Encoding utf8
 }
 
 # 닉네임 변경: 상태 전부 리셋 후 새 닉으로 재조회
@@ -2847,6 +3401,7 @@ function Refresh-All {
 # 박스/리포트 크기 배율 적용 (0.6~2.0)
 $script:ScaleSteps = @(0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0)
 $script:AnomPctOptions = @(5, 10, 15, 20, 25, 30, 40, 50)
+$script:BgAlphaOptions = @(-1, 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
 
 function Apply-Scale {
     param($Box)
@@ -2885,6 +3440,46 @@ function Set-UiScale {
     }
 }
 
+# 기본 글자색 견본 동기화
+function Sync-TxtColSwatch {
+    $b = $script:MyBox
+    if (-not $b -or -not $b.SwTxtCol) { return }
+    $c = [string]$script:Settings.TextColor
+    if (-not $c) {
+        switch ($script:Theme) {
+            'dark' { $c = '#FFD9DCE1' }
+            'trans' { $c = '#FFFFFFFF' }
+            default { $c = '#FF16213E' }
+        }
+    }
+    try { $b.SwTxtCol.Background = New-Brush $c } catch {}
+    if ($b.SwBgCol) {
+        $bc = [string]$script:Settings.BgColor
+        if (-not $bc) {
+            switch ($script:Theme) {
+                'light' { $bc = '#FFFFFFFF' }
+                default { $bc = '#FF10131C' }
+            }
+        }
+        try { $b.SwBgCol.Background = New-Brush $bc } catch {}
+    }
+    if ($b.CmbBgAlpha -and $b.CmbBgAlpha.Items.Count -gt 0) {
+        $script:SyncingUI = $true
+        $ai = [Array]::IndexOf($script:BgAlphaOptions, [int]$script:Settings.BgAlpha)
+        $b.CmbBgAlpha.SelectedIndex = [math]::Max(0, $ai)
+        $script:SyncingUI = $false
+    }
+}
+
+# 프리셋 콤보 목록 동기화
+function Sync-PresetList {
+    param($B)
+    if (-not $B -or -not $B.CmbPreset) { return }
+    $B.CmbPreset.Items.Clear()
+    foreach ($nm in @($script:Presets.Keys | Sort-Object)) { $null = $B.CmbPreset.Items.Add($nm) }
+    if ($B.CmbPreset.Items.Count -gt 0) { $B.CmbPreset.SelectedIndex = 0 }
+}
+
 # 체크 상태에 따라 하위 설정 섹션 표시/숨김
 function Sync-SettingSections {
     foreach ($b in Get-AllBoxes) {
@@ -2901,6 +3496,12 @@ function Sync-SettingSections {
         if (-not $bg) {
             $b.BadgePanel.Visibility = 'Collapsed'
             $b.BtnBadgeAdv.Text = '   고급 설정 ▾'
+        }
+        $stOn = [bool]$script:Settings.Stable
+        $b.BtnStableAdv.Visibility = $(if ($stOn) { 'Visible' } else { 'Collapsed' })
+        if (-not $stOn) {
+            $b.StablePanel.Visibility = 'Collapsed'
+            $b.BtnStableAdv.Text = '   고급 설정 ▾'
         }
     }
 }
@@ -3256,6 +3857,139 @@ function Build-BadgePanel {
 
 }
 
+# 안정단위 고급 설정: 기준 모드(나/상대) + 등급 구간 색상
+function Build-StablePanel {
+    param($Box)
+    if (-not $Box.StablePanel) { return }
+    $Box.StablePanel.Children.Clear()
+    $fg = $Box.CbAnom.Foreground
+    $modeCodes = @('auto', '8', '9', '11', '12', '15', '16')
+    $modeLabels = @('자동(다수결)', '금동', '금남', '옥동', '옥남', '왕좌동', '왕좌남')
+
+    foreach ($t in @(@{ K = 'MyStableMode'; N = '내 기준 모드' }, @{ K = 'OppStableMode'; N = '상대 기준 모드' })) {
+        $row = New-Object Windows.Controls.StackPanel
+        $row.Orientation = 'Horizontal'
+        $row.Margin = New-Object Windows.Thickness 0, 1, 0, 1
+        $lb = New-Object Windows.Controls.TextBlock
+        $lb.Text = [string]$t.N
+        $lb.FontFamily = New-Object Windows.Media.FontFamily 'Malgun Gothic'
+        $lb.FontSize = 12
+        $lb.FontWeight = [Windows.FontWeights]::Bold
+        $lb.Foreground = $fg
+        $lb.Width = 104
+        $lb.VerticalAlignment = 'Center'
+        $null = $row.Children.Add($lb)
+        $cmb = New-Object Windows.Controls.ComboBox
+        $cmb.Width = 110
+        $cmb.FontSize = 11.5
+        foreach ($ml in $modeLabels) { $null = $cmb.Items.Add($ml) }
+        $ci = [Array]::IndexOf($modeCodes, [string]$script:Settings[[string]$t.K])
+        $cmb.SelectedIndex = [math]::Max(0, $ci)
+        $cmb.Tag = [string]$t.K
+        $cmb.Add_SelectionChanged({
+            $c = $args[0]
+            if ($c.SelectedIndex -lt 0) { return }
+            $codes = @('auto', '8', '9', '11', '12', '15', '16')
+            $k = [string]$c.Tag
+            $script:Settings[$k] = $codes[$c.SelectedIndex]
+            Save-Pos
+            if ($k -eq 'MyStableMode') {
+                $script:MyDomModeKey = $null   # 판별 캐시 무효화
+                Update-Overlay
+            } else {
+                $script:OppCache = @{}         # 다음 스캔부터 새 기준
+            }
+        })
+        $null = $row.Children.Add($cmb)
+        $null = $Box.StablePanel.Children.Add($row)
+    }
+
+    # 금캉스 구분: 금탁에서 옥탁 20국+ 상대는 옥 기준 병행 표시
+    $cbd = New-Object Windows.Controls.CheckBox
+    $cbd.Content = '금탁에서 옥탁 기준 병행 표시'
+    $cbd.FontFamily = New-Object Windows.Media.FontFamily 'Malgun Gothic'
+    $cbd.FontSize = 12
+    $cbd.FontWeight = [Windows.FontWeights]::Bold
+    $cbd.Foreground = $fg
+    $cbd.Margin = New-Object Windows.Thickness 0, 3, 0, 1
+    $cbd.IsChecked = [bool]$script:Settings.StableDual
+    $cbd.ToolTip = '옥탁 20국 이상 기록이 있는 상대를 금탁에서 만나면 금·옥 기준을 모두 표시 (금캉스 구분)'
+    [Windows.Controls.ToolTipService]::SetInitialShowDelay($cbd, 0)
+    $cbd.Add_Click({
+        $script:Settings.StableDual = [bool]$args[0].IsChecked
+        Save-Pos
+        $script:OppCache = @{}   # 다음 스캔부터 적용
+    })
+    $null = $Box.StablePanel.Children.Add($cbd)
+
+    $hd = New-Object Windows.Controls.TextBlock
+    $hd.Text = '── 구간 색상 ──'
+    $hd.FontFamily = New-Object Windows.Media.FontFamily 'Malgun Gothic'
+    $hd.FontSize = 11.5
+    $hd.FontWeight = [Windows.FontWeights]::Bold
+    $hd.Foreground = $fg
+    $hd.Opacity = 0.7
+    $hd.Margin = New-Object Windows.Thickness 0, 5, 0, 2
+    $null = $Box.StablePanel.Children.Add($hd)
+
+    foreach ($tk in 'sasa', 'geol', 'ho', 'seong', 'konten') {
+        $row = New-Object Windows.Controls.StackPanel
+        $row.Orientation = 'Horizontal'
+        $row.Margin = New-Object Windows.Thickness 0, 1, 0, 1
+        $lb = New-Object Windows.Controls.TextBlock
+        $lb.Text = [string]$script:StableTierNames[$tk]
+        $lb.FontFamily = New-Object Windows.Media.FontFamily 'Malgun Gothic'
+        $lb.FontSize = 12
+        $lb.FontWeight = [Windows.FontWeights]::Bold
+        $lb.Foreground = $fg
+        $lb.Width = 104
+        $lb.VerticalAlignment = 'Center'
+        $null = $row.Children.Add($lb)
+        $sw = New-Object Windows.Controls.Border
+        $sw.Width = 20; $sw.Height = 15
+        $sw.CornerRadius = New-Object Windows.CornerRadius 3
+        $sw.BorderThickness = New-Object Windows.Thickness 1
+        $sw.BorderBrush = New-Brush '#88888888'
+        $sw.Cursor = [Windows.Input.Cursors]::Hand
+        $sw.Background = New-Brush (Get-StableTierColor $tk)
+        $sw.Tag = @{ T = $tk; B = $Box }
+        $sw.Add_MouseLeftButtonDown({
+            $args[1].Handled = $true
+            $t2 = $args[0].Tag
+            $script:PickCtx = $t2
+            Show-ColorPicker $args[0] (Get-StableTierColor ([string]$t2.T)) {
+                param($hex)
+                $c2 = $script:PickCtx
+                Set-StableTierColor ([string]$c2.T) $hex
+                Save-Pos
+                Build-StablePanel $c2.B
+                Refresh-Display
+            }
+        })
+        $null = $row.Children.Add($sw)
+        $null = $Box.StablePanel.Children.Add($row)
+    }
+
+    $rst = New-Object Windows.Controls.TextBlock
+    $rst.Text = '색 기본값으로 되돌리기'
+    $rst.FontFamily = New-Object Windows.Media.FontFamily 'Malgun Gothic'
+    $rst.FontSize = 11.5
+    $rst.FontWeight = [Windows.FontWeights]::Bold
+    $rst.Foreground = $fg
+    $rst.Opacity = 0.75
+    $rst.Margin = New-Object Windows.Thickness 0, 4, 0, 0
+    $rst.Cursor = [Windows.Input.Cursors]::Hand
+    $rst.Tag = $Box
+    $rst.Add_MouseLeftButtonDown({
+        $args[1].Handled = $true
+        $script:Settings.StableColors = ''
+        Save-Pos
+        Build-StablePanel $args[0].Tag
+        Refresh-Display
+    })
+    $null = $Box.StablePanel.Children.Add($rst)
+}
+
 # 고급 설정: 대상(나/상대)별 · 항목별 강조 on/off 및 색상
 $script:AdvTarget = 'me'
 
@@ -3404,20 +4138,35 @@ function Set-StatWindow {
     $nameRun = New-Object Windows.Documents.Run
     $nameRun.Text = $Data.Name
     if ($null -ne $Data.NameColorVal -and (Test-DispOn 'NameColor' $isOppBox)) {
-        if ($Data.NameColorVal -gt 4) { $nameRun.Foreground = New-Brush $cRed }
-        elseif ($Data.NameColorVal -gt 3) { $nameRun.Foreground = New-Brush $cOrange }
-        else { $nameRun.Foreground = New-Brush $cGreen }
+        $tier = [string]$Data.StableTier
+        if (-not $tier) {
+            # 구버전 캐시 폴백: 값 기준
+            if ($Data.NameColorVal -gt 4) { $tier = 'seong' } elseif ($Data.NameColorVal -gt 1) { $tier = 'ho' } else { $tier = 'geol' }
+        }
+        $nameRun.Foreground = New-Brush (Get-StableTierColor $tier)
     }
     $Box.TbName.Inlines.Add($nameRun)
     $sfxText = ''
-    if ($Data.NameSuffix -and (Test-DispOn 'Stable' $isOppBox)) { $sfxText += [string]$Data.NameSuffix }
+    if ($Data.NameSuffix -and $script:Settings.Stable -and (Test-DispOn 'Stable' $isOppBox)) { $sfxText += [string]$Data.NameSuffix }
     if ($Data.Badges -and $script:Settings.BadgeOn -and (Test-DispOn 'Badge' $isOppBox)) { $sfxText += '  ' + [string]$Data.Badges }
+    $sfx2Text = ''
+    if ($Data.NameSuffix2 -and $script:Settings.Stable -and (Test-DispOn 'Stable' $isOppBox)) { $sfx2Text = [string]$Data.NameSuffix2 }
     if ($sfxText) {
         $sfx = New-Object Windows.Documents.Run
         $sfx.Text = $sfxText
         $sfx.FontSize = [math]::Max(10, $Box.TbName.FontSize - 4.5)
         if ($null -ne $Data.NameColorVal -and (Test-DispOn 'NameColor' $isOppBox)) { $sfx.Foreground = $nameRun.Foreground }
         $Box.TbName.Inlines.Add($sfx)
+        if ($sfx2Text) {
+            # 병행(금+옥) 두 번째 기준은 다음 줄에
+            $Box.TbName.Inlines.Add((New-Object Windows.Documents.LineBreak))
+            $sfx2 = New-Object Windows.Documents.Run
+            $sfx2.Text = $sfx2Text
+            $sfx2.FontSize = $sfx.FontSize
+            $sfx2.FontWeight = $sfx.FontWeight
+            $sfx2.Foreground = $sfx.Foreground
+            $Box.TbName.Inlines.Add($sfx2)
+        }
     }
 
     # 표시 항목 토글
@@ -3483,8 +4232,8 @@ function Set-StatWindow {
     if ($Data.StatParts) { $sParts = @($Data.StatParts | ForEach-Object { $_ }) }
     $rankMajor = 3
     if ($Data.RankMajor) { $rankMajor = [int]$Data.RankMajor }
-    $lineMap = @{ 1 = $Box.TbStat; 2 = $Box.TbStat2; 3 = $Box.TbStat3; 4 = $Box.TbStat4 }
-    foreach ($ln in 1, 2, 3, 4) {
+    $lineMap = @{ 1 = $Box.TbStat; 2 = $Box.TbStat2; 3 = $Box.TbStat3; 4 = $Box.TbStat4; 5 = $Box.TbStat5 }
+    foreach ($ln in 1, 2, 3, 4, 5) {
         $tb = $lineMap[$ln]
         $lp = @($sParts | Where-Object { [int]$_.L -eq $ln })
         if (-not (Test-DispOn 'Tobi' $isOppBox)) { $lp = @($lp | Where-Object { [string]$_.K -ne 'tobi' }) }
@@ -4849,6 +5598,52 @@ $script:DetailPollTimer = $detailPollTimer
 # --- 내 전적 박스 ---
 $script:Theme = 'light'
 $script:LastData = $null
+# 설정 별도 창: 메인 박스의 SettingsPanel을 런타임에 이 창으로 옮겨 담는다 (배선은 그대로 유효)
+$script:SettingsShellXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" SizeToContent="WidthAndHeight" ResizeMode="NoResize">
+  <Border x:Name="SetRoot" CornerRadius="12" Background="#F5202433" Padding="16,10,12,14">
+    <StackPanel Width="392">
+      <DockPanel Margin="0,0,4,4">
+        <TextBlock x:Name="SetClose" Text="✕" DockPanel.Dock="Right" FontFamily="Malgun Gothic" FontSize="14" FontWeight="Bold" Foreground="#FF8A93A6" Cursor="Hand" Padding="8,0,0,0"/>
+        <TextBlock x:Name="SetTitle" Text="⚙ 설정" FontFamily="Malgun Gothic" FontSize="14.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8"/>
+      </DockPanel>
+      <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="760" Padding="0,0,10,0">
+        <ScrollViewer.Resources>
+          <!-- 안드로이드풍 슬림 스크롤바: 화살표 없이 얇은 둥근 썸만 -->
+          <Style TargetType="{x:Type ScrollBar}">
+            <Setter Property="Width" Value="5"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Template">
+              <Setter.Value>
+                <ControlTemplate TargetType="{x:Type ScrollBar}">
+                  <Grid Background="Transparent" Width="5">
+                    <Track x:Name="PART_Track" IsDirectionReversed="True">
+                      <Track.Thumb>
+                        <Thumb>
+                          <Thumb.Template>
+                            <ControlTemplate TargetType="{x:Type Thumb}">
+                              <Border Background="#55AAB4C4" CornerRadius="2.5"/>
+                            </ControlTemplate>
+                          </Thumb.Template>
+                        </Thumb>
+                      </Track.Thumb>
+                    </Track>
+                  </Grid>
+                </ControlTemplate>
+              </Setter.Value>
+            </Setter>
+          </Style>
+        </ScrollViewer.Resources>
+        <ContentControl x:Name="SetHost"/>
+      </ScrollViewer>
+    </StackPanel>
+  </Border>
+</Window>
+'@
+
 $my = New-StatWindow $BoxXaml
 $win = $my.Win
 $script:MyBox = $my
@@ -4880,7 +5675,7 @@ if (Test-Path $posFile) {
         }
         if ($pos.Theme -and @('light', 'dark', 'trans') -contains $pos.Theme) { $script:Theme = $pos.Theme }
         if ($pos.Settings) {
-            foreach ($k in @('Stable', 'Danger', 'RankColors', 'Streak', 'Spark', 'Toast', 'MortalWatch', 'ShowTobi', 'Anom', 'BadgeOn',
+            foreach ($k in @('Stable', 'Danger', 'RankColors', 'Streak', 'Spark', 'Toast', 'MortalWatch', 'ShowTobi', 'Anom', 'BadgeOn', 'StableDual',
                              'ShowRank', 'ShowGoal', 'ShowGame', 'ShowStat1', 'ShowStat2', 'ShowStat3', 'ShowStat4')) {
                 if ($null -ne $pos.Settings.$k) { $script:Settings[$k] = [bool]$pos.Settings.$k }
             }
@@ -4898,10 +5693,23 @@ if (Test-Path $posFile) {
             if ($null -ne $pos.Settings.DailyGoal) { $script:Settings.DailyGoal = [int]$pos.Settings.DailyGoal }
             if ($null -ne $pos.Settings.OppMinN) { $script:Settings.OppMinN = [int]$pos.Settings.OppMinN }
             if ($null -ne $pos.Settings.UiScale) { $script:Settings.UiScale = [double]$pos.Settings.UiScale }
+            if ($null -ne $pos.Settings.BgAlpha) { $script:Settings.BgAlpha = [int]$pos.Settings.BgAlpha }
             if ($pos.Settings.SessionBase) { $script:Settings.SessionBase = [string]$pos.Settings.SessionBase }
             if ($null -ne $pos.Settings.AnomPct) { $script:Settings.AnomPct = [int]$pos.Settings.AnomPct }
             if ($null -ne $pos.Settings.BadgeDefs) { $script:Settings.BadgeDefs = [string]$pos.Settings.BadgeDefs }
-            foreach ($sk in @('AnomMode', 'AnomHigh', 'AnomLow', 'AnomOffMe', 'AnomOffOpp', 'AnomCMe', 'AnomCOpp', 'DispOffMe', 'DispOffOpp')) {
+            # 프리셋 복원 (PSObject → 해시테이블)
+            if ($pos.Presets) {
+                foreach ($pn in $pos.Presets.PSObject.Properties.Name) {
+                    $pv = $pos.Presets.$pn
+                    $ps2 = @{}
+                    if ($pv.Settings) {
+                        foreach ($spn in $pv.Settings.PSObject.Properties.Name) { $ps2[$spn] = $pv.Settings.$spn }
+                    }
+                    $script:Presets[$pn] = @{ Theme = [string]$pv.Theme; Settings = $ps2 }
+                }
+            }
+            foreach ($sk in @('AnomMode', 'AnomHigh', 'AnomLow', 'AnomOffMe', 'AnomOffOpp', 'AnomCMe', 'AnomCOpp', 'DispOffMe', 'DispOffOpp',
+                              'MyStableMode', 'OppStableMode', 'StableColors', 'TextColor', 'BgColor')) {
                 if ($null -ne $pos.Settings.$sk) { $script:Settings[$sk] = [string]$pos.Settings.$sk }
             }
             # 구버전 설정(AnomOff 단일) 이전
@@ -4912,6 +5720,20 @@ if (Test-Path $posFile) {
         }
     } catch {}
 }
+# 설정 패널을 별도 창으로 이사
+try {
+    $sw2 = [Windows.Markup.XamlReader]::Parse($script:SettingsShellXaml)
+    $my.Panel.Children.Remove($my.SettingsPanel)
+    $sw2.FindName('SetHost').Content = $my.SettingsPanel
+    $my.SettingsPanel.Visibility = 'Visible'
+    $my | Add-Member -NotePropertyName SetRoot -NotePropertyValue ($sw2.FindName('SetRoot')) -Force
+    $my | Add-Member -NotePropertyName SetTitle -NotePropertyValue ($sw2.FindName('SetTitle')) -Force
+    $my | Add-Member -NotePropertyName SetClose -NotePropertyValue ($sw2.FindName('SetClose')) -Force
+    $sw2.FindName('SetClose').Add_MouseLeftButtonDown({ $args[1].Handled = $true; $script:SettingsWin.Hide() })
+    $sw2.Add_MouseLeftButtonDown({ try { $script:SettingsWin.DragMove() } catch {} })
+    $script:SettingsWin = $sw2
+} catch {}
+
 Apply-Theme $my
 Apply-Scale $my
 Update-HelpTexts
@@ -4992,6 +5814,15 @@ function Write-ScanBoxFile {
             }
         }
         $rect.Opp = $opp
+        # 방 추정 (OCR 실패 시 폴백): 수동 설정 > 내 주력 모드 > 내 단위 기반
+        $guess = 0
+        if ([string]$script:Settings.MyStableMode -match '^\d+$') { $guess = [int]$script:Settings.MyStableMode }
+        elseif ($script:MyDomMode) { $guess = [int]$script:MyDomMode }
+        else {
+            $mj = ([int][math]::Floor([int]$script:CurLvlId / 100)) % 100
+            $guess = switch ($mj) { 4 { 12 } 5 { 12 } 6 { 16 } default { 9 } }
+        }
+        $rect.Room = $guess
         ConvertTo-Json -InputObject $rect -Depth 4 | Out-File (Join-Path $PSScriptRoot 'scan-box.json') -Encoding utf8
     } catch {}
 }
