@@ -1,6 +1,6 @@
 ﻿# ═══════════════════════════════════════════════════════════
 #  작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
-#  v1.0.3  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
+#  v1.0.4  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
 #  데이터: amae-koromo(雀魂牌谱屋) 공개 API — 게임에 개입하지 않음
 # ═══════════════════════════════════════════════════════════
 
@@ -376,7 +376,10 @@ function Get-BasisLabel {
     }
 }
 
-# 안정단위 추정 (amae-koromo estimateStableLevel2, 옥남 기준): 기대수지/(4위율*15) - 10
+# Ported from amae-koromo — estimateStableLevel2()
+#   https://github.com/SAPikachu/amae-koromo
+#   Copyright (c) 2020 SAPikachu, MIT License — see LICENSE (third-party notices)
+# 안정단위 추정 (옥남 기준): 기대수지/(4위율*15) - 10
 function Get-StableLevel {
     param($Stats)
     $r = @($Stats.rank_rates)
@@ -444,7 +447,7 @@ function Get-PtAt {
 
 # 리포트 팩 생성 (일/주/월/년/전체) - 백그라운드 프로세스에서 호출됨
 function Build-ReportPack {
-    param([string]$Mode, [DateTime]$Anchor)
+    param([string]$Mode, [DateTime]$Anchor, [DateTime]$RangeEnd = [DateTime]::MinValue)
     $id = Get-PlayerId
     $today = [DateTime]::Today
     if ($Mode -eq 'day') {
@@ -506,6 +509,36 @@ function Build-ReportPack {
         $bounds = @(); for ($i = 0; $i -le $dim; $i++) { $bounds += $s.AddDays($i) }
         $labels = @(1..$dim | ForEach-Object { [string]$_ })
         $title = ('{0}년 {1}월' -f $s.Year, $s.Month)
+    } elseif ($Mode -eq 'range') {
+        # 사용자 지정 기간: 길이에 따라 일/주/월 단위 버킷
+        $s = $Anchor.Date
+        $e = $RangeEnd.Date
+        if ($e -lt $s) { $t0 = $s; $s = $e; $e = $t0 }
+        if ($e -gt $today) { $e = $today }
+        $rEnd = $e.AddDays(1)
+        $span = ($rEnd - $s).Days
+        $bounds = @(); $labels = @()
+        if ($span -le 31) {
+            $d = $s
+            while ($d -lt $rEnd) { $bounds += $d; $labels += ('{0}/{1}' -f $d.Month, $d.Day); $d = $d.AddDays(1) }
+            $bounds += $rEnd
+        } elseif ($span -le 182) {
+            $d = $s
+            while ($d -lt $rEnd) { $bounds += $d; $labels += ('{0}/{1}' -f $d.Month, $d.Day); $d = $d.AddDays(7) }
+            $bounds += $rEnd
+        } else {
+            $d = New-Object DateTime $s.Year, $s.Month, 1
+            $bounds += $s
+            $labels += ('{0:yy}/{1}' -f $s, $s.Month)
+            $d = $d.AddMonths(1)
+            while ($d -lt $rEnd) { $bounds += $d; $labels += ('{0:yy}/{1}' -f $d, $d.Month); $d = $d.AddMonths(1) }
+            $bounds += $rEnd
+        }
+        if ($s.Year -ne $e.Year) {
+            $title = ('{0}.{1}/{2}~{3}.{4}/{5}' -f $s.Year, $s.Month, $s.Day, $e.Year, $e.Month, $e.Day)
+        } else {
+            $title = ('{0}/{1}~{2}/{3}' -f $s.Month, $s.Day, $e.Month, $e.Day)
+        }
     } elseif ($Mode -eq 'all') {
         # 전체 기간 = 연도별 버킷 (amae-koromo 데이터가 존재하는 2018년부터, 빈 앞구간은 아래서 잘라냄)
         $s = New-Object DateTime 2018, 1, 1
@@ -1114,6 +1147,134 @@ function Get-FullTokens {
     return $out
 }
 
+# ═══ PaddleOCR 엔진 (동봉형, 있으면 우선 사용) ═══
+# engine 폴더 아래 어디에 있든 PaddleOCR-json.exe를 찾음 (버전 폴더명 무관, 바로 넣어도 됨)
+$script:PaddleExe = $null
+try {
+    $engDir = Join-Path $PSScriptRoot 'engine'
+    if (Test-Path $engDir) {
+        $hit = Get-ChildItem $engDir -Filter 'PaddleOCR-json.exe' -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName | Select-Object -First 1
+        if ($hit) { $script:PaddleExe = $hit.FullName }
+    }
+} catch {}
+$script:PaddleOk = [bool]$script:PaddleExe
+$script:PaddleFails = 0
+
+# 한 언어 모델 프로세스로 여러 이미지를 인식 (요청당 JSON 한 줄)
+function Trace-Paddle { param([string]$M)
+    try {
+        $f = Join-Path $PSScriptRoot 'paddle-debug.txt'
+        if ((Test-Path $f) -and (Get-Item $f).Length -gt 200KB) { Remove-Item $f -Force }
+        Add-Content -Path $f -Value "$(Get-Date -Format HH:mm:ss.fff) [$PID] $M" -Encoding UTF8
+    } catch {}
+}
+
+function Invoke-PaddleBatch {
+    param([string]$Config, [string[]]$Images)
+    $out = @()
+    $proc = $null
+    Trace-Paddle "batch start: $Config ($($Images.Count) imgs)"
+    try {
+        $psi = New-Object Diagnostics.ProcessStartInfo
+        $psi.FileName = $script:PaddleExe
+        $psi.Arguments = "--config_path=models/config_$Config.txt"
+        $psi.WorkingDirectory = Split-Path $script:PaddleExe
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+        $psi.CreateNoWindow = $true
+        $proc = [Diagnostics.Process]::Start($psi)
+        Trace-Paddle "proc started: $Config pid=$($proc.Id)"
+        $proc.BeginErrorReadLine()
+        foreach ($img in $Images) {
+            $proc.StandardInput.WriteLine('{"image_path": "' + $img.Replace([string][char]0x5C, '/') + '"}')
+        }
+        $proc.StandardInput.Flush()
+        $got = 0
+        for ($i = 0; $i -lt 400 -and $got -lt $Images.Count; $i++) {
+            $task = $proc.StandardOutput.ReadLineAsync()
+            if (-not $task.Wait(20000)) { Trace-Paddle "read timeout: $Config"; break }   # 20초 내 응답 없으면 포기
+            $line = $task.Result
+            if ($null -eq $line) { break }
+            if (-not $line.StartsWith('{')) { continue }
+            $res = $null
+            try { $res = $line | ConvertFrom-Json } catch {}
+            $out += , @{ Img = $Images[$got]; Res = $res }
+            $got++
+        }
+    } catch { Trace-Paddle "batch 예외: $($_.Exception.Message)" } finally {
+        if ($proc) { try { $proc.Kill() } catch {} }
+    }
+    Trace-Paddle "batch done: $Config -> $($out.Count)"
+    return $out
+}
+
+# Paddle로 전체 화면 + 명패 확대 크롭을 인식해 파이프라인 토큰 형식으로 반환
+function Get-PaddleTokens {
+    param($Bmp)
+    Trace-Paddle 'Get-PaddleTokens start'
+    $tmp = $env:TEMP
+    $imgs = @()
+    $meta = @{}
+    # 전체 화면
+    $fp = Join-Path $tmp "mjs-paddle-$PID-full.png"
+    $Bmp.Save($fp, [Drawing.Imaging.ImageFormat]::Png)
+    $imgs += $fp
+    $meta[$fp] = @{ RX = 0; RY = 0; Z = 1.0; Src = 'f' }
+    # 명패 크롭 4곳 (4배 확대)
+    $bands = @(
+        @(0.000, 0.29, 0.15, 0.12),
+        @(0.66,  0.07, 0.24, 0.12),
+        @(0.85,  0.29, 0.15, 0.12),
+        @(0.15,  0.74, 0.22, 0.14)
+    )
+    $bi = 0
+    foreach ($bd in $bands) {
+        $rx = [int]($Bmp.Width * $bd[0]); $ry = [int]($Bmp.Height * $bd[1])
+        $rw = [int]($Bmp.Width * $bd[2]); $rh = [int]($Bmp.Height * $bd[3])
+        if ($rx + $rw -gt $Bmp.Width) { $rw = $Bmp.Width - $rx }
+        if ($ry + $rh -gt $Bmp.Height) { $rh = $Bmp.Height - $ry }
+        try {
+            $crop = $Bmp.Clone((New-Object Drawing.Rectangle $rx, $ry, $rw, $rh), $Bmp.PixelFormat)
+            $big = New-ResizedBitmap $crop 4.0
+            $crop.Dispose()
+            $cp = Join-Path $tmp "mjs-paddle-$PID-b$bi.png"
+            $big.Save($cp, [Drawing.Imaging.ImageFormat]::Png)
+            $big.Dispose()
+            $imgs += $cp
+            $meta[$cp] = @{ RX = $rx; RY = $ry; Z = 4.0; Src = 'p' }
+        } catch {}
+        $bi++
+    }
+    Trace-Paddle "images ready: $($imgs.Count)"
+    $tokens = New-Object Collections.ArrayList
+    foreach ($cfg in 'japan', 'chinese', 'korean') {
+        foreach ($r in (Invoke-PaddleBatch $cfg $imgs)) {
+            if (-not $r.Res -or $r.Res.code -ne 100) { continue }
+            $m = $meta[[string]$r.Img]
+            foreach ($d in $r.Res.data) {
+                # 신뢰도 필터: 잡음 원천 차단 (명패 크롭은 완화)
+                $minScore = 0.60
+                if ($m.Src -eq 'p') { $minScore = 0.45 }
+                if ([double]$d.score -lt $minScore) { continue }
+                $t = Convert-FullWidth ([string]$d.text)
+                if (-not $t) { continue }
+                $null = $tokens.Add(@{
+                    Text = $t
+                    X = ($m.RX + [double]$d.box[0][0] / $m.Z)
+                    Y = ($m.RY + [double]$d.box[0][1] / $m.Z)
+                    Src = [string]$m.Src
+                })
+            }
+        }
+    }
+    Trace-Paddle "tokens: $($tokens.Count)"
+    return $tokens
+}
+
 # 상대 명패 정밀 스캔 - 좁은 영역을 크게 확대할수록 인식률이 크게 오름
 $script:PlateBands = @(
     @(0.000, 0.29, 0.15, 0.12, 8.0),   # 왼쪽 이름표 (정밀)
@@ -1315,6 +1476,12 @@ function Get-TokenVariants {
                 $v = $base.Replace([string][char]0x30FC, [string][char]0x4E00)
                 if ($variants -notcontains $v) { $null = $variants.Add($v) }
             }
+            # 가나 へ/ヘ로 잘못 읽힌 전각 물결 (じゃんにへにへ → じゃんに〜に〜)
+            if ($base -match '[へヘ]' -and $base -match '[ぁ-ゖァ-ヺ]') {
+                foreach ($v in @($base.Replace([string][char]0x3078, [string][char]0x301C), $base.Replace([string][char]0x30D8, [string][char]0x301C))) {
+                    if ($v -ne $base -and $variants -notcontains $v) { $null = $variants.Add($v) }
+                }
+            }
             # 물결표 정규화: OCR의 ASCII ~ → 닉네임의 전각 물결 (貞~照 → 貞〜照)
             if ($base.Contains('~')) {
                 foreach ($v in @($base.Replace('~', [string][char]0x301C), $base.Replace('~', [string][char]0xFF5E))) {
@@ -1429,9 +1596,15 @@ function Find-ByPrefixOne {
 
 # 후보 닉네임으로서 그럴듯한지 (OCR 잡음 걸러내기)
 function Test-NickPlausible {
-    param([string]$T)
+    param([string]$T, [bool]$Lenient = $false)
+    # 명패 위치 토큰은 위치 자체가 신뢰 근거 - 순수 숫자와 같은 글자 반복만 거름 ((+_+)~ 같은 기호 닉 허용)
+    if ($Lenient) {
+        if ($T -match '^[\d.,]+$') { return $false }
+        if ($T -imatch '^([a-z0-9])\1+$') { return $false }
+        return $true
+    }
     if ($T -match '^[\d.,:%/()\-±▲▼xX×*·。、]+$') { return $false }
-    if ($T -imatch '^([a-z0-9])+$') { return $false }
+    if ($T -imatch '^([a-z0-9])\1+$') { return $false }
     # 한글 + 라틴/숫자 혼합은 대부분 OCR 잡음
     if ($T -match '[가-힣]' -and $T -match '[A-Za-z0-9]') { return $false }
     # 숫자·기호 비중이 과반이면 잡음 (단 물결표는 일본어 닉에 흔해서 가나·한자 토큰에선 세지 않음)
@@ -1541,7 +1714,7 @@ function Resolve-Tokens {
             if ($t.Length -lt $minLen -or $t.Length -gt 16) { continue }
             if ($t -eq $myNick) { $script:SawMyNick = $true; continue }
             if ($StopWords -contains $t) { continue }
-            if (-not (Test-NickPlausible $t)) { continue }
+            if (-not (Test-NickPlausible $t ($tk.Src -eq 'p'))) { continue }
             if ($seen.ContainsKey($t)) { continue }
             $seen[$t] = $true
 
@@ -1629,6 +1802,12 @@ function Scan-Opponents {
     param([scriptblock]$OnProgress = $null)
     if (-not $script:OcrOk) { return @() }
     $script:ScanLog = New-Object Collections.ArrayList
+    # 이전 스캔이 강제 종료되며 남긴 고아 엔진 프로세스 정리 (10분 이상 된 것만 - 병렬 스캔 보호)
+    try {
+        Get-Process PaddleOCR-json -ErrorAction SilentlyContinue |
+            Where-Object { ((Get-Date) - $_.StartTime).TotalMinutes -gt 10 } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+    } catch {}
     $script:ScanQueryLeft = 60   # 스캔 1회당 최대 조회 수 (속도 제한 방지)
     $script:SkipRects = @()
     $script:SawMyNick = $false
@@ -1670,6 +1849,37 @@ function Scan-Opponents {
         $bmp = $null
         try { $bmp = Get-ScreenCapture } catch { continue }
         try {
+            if ($script:PaddleOk) {
+                # Paddle 엔진: 전체+명패를 한 번에 (빠르고 신뢰도 필터 내장)
+                $pt = Get-PaddleTokens $bmp
+                $null = $script:ScanLog.Add("--- Paddle 스캔 (토큰 $($pt.Count)개)")
+                if ($pt.Count -eq 0) {
+                    # 엔진이 연속으로 빈손이면 고장으로 보고 Windows OCR로 전환
+                    $script:PaddleFails++
+                    if ($script:PaddleFails -ge 2) {
+                        $script:PaddleOk = $false
+                        $null = $script:ScanLog.Add('!! Paddle 엔진 응답 없음 - Windows OCR로 폴백')
+                    }
+                } else { $script:PaddleFails = 0 }
+                if ($pt.Count -gt 0) {
+                    $isRank = (@($pt | Where-Object { ($_.Text -replace '\s', '') -match '^[1-4](위|位)' }).Count -gt 0)
+                    Resolve-Tokens $pt $found $isRank
+                    # Paddle이 정원을 못 채우면 Windows OCR 명패 정밀 패스로 보충
+                    # (기호 전용 닉 등 CJK 모델 사각지대 - 예: (+_+)~ )
+                    $target = 4
+                    if ($script:SawMyNick) { $target = 3 }
+                    if ($found.Count -lt $target -and $try -ge 2 -and -not $isRank) {
+                        $null = $script:ScanLog.Add('--- 보충: Windows 명패 스캔')
+                        try { Resolve-Tokens (Get-PlateTokens $bmp 0) $found } catch {}
+                    }
+                    if ($bmp) { $bmp.Dispose(); $bmp = $null }
+                    continue
+                }
+                if ($script:PaddleOk) {
+                    if ($bmp) { $bmp.Dispose(); $bmp = $null }
+                    continue
+                }
+            }
             $fullT = Get-FullTokens $bmp
             $isRankScreen = (@($fullT | Where-Object { ($_.Text -replace '\s', '') -match '^[1-4](위|位)(?!\d+(국|局))' }).Count -gt 0)
             if ($isRankScreen) {
@@ -1819,7 +2029,11 @@ if ($riIdx -ge 0) {
     } catch {}
     $rMode = [string]$args[$riIdx + 1]
     $rAnchor = [DateTime]::ParseExact([string]$args[$riIdx + 2], 'yyyy-MM-dd', $null)
-    $pack = Build-ReportPack $rMode $rAnchor
+    $rEnd2 = [DateTime]::MinValue
+    if ($rMode -eq 'range' -and $args.Count -gt ($riIdx + 3)) {
+        $rEnd2 = [DateTime]::ParseExact([string]$args[$riIdx + 3], 'yyyy-MM-dd', $null)
+    }
+    $pack = Build-ReportPack $rMode $rAnchor $rEnd2
     ConvertTo-Json -InputObject $pack -Depth 6 | Out-File (Join-Path $PSScriptRoot 'report-result.json') -Encoding utf8
     exit 0
 }
@@ -3548,6 +3762,7 @@ function Get-PeriodAnchor {
         'month' { return (New-Object DateTime $D.Year, $D.Month, 1) }
         'year' { return (New-Object DateTime $D.Year, 1, 1) }
         'all' { return (New-Object DateTime 2010, 1, 1) }
+        'range' { return $D.Date }
         default { return $D.Date }
     }
 }
@@ -3562,6 +3777,11 @@ function Get-PeriodRange {
         'month' { $e = $s.AddMonths(1) }
         'year' { $e = $s.AddYears(1) }
         'all' { $e = [DateTime]::Today.AddDays(1) }
+        'range' {
+            $e = $s.AddDays(1)
+            if ($script:ReportRangeEnd -is [DateTime]) { $e = ([DateTime]$script:ReportRangeEnd).Date.AddDays(1) }
+            if ($e -le $s) { $e = $s.AddDays(1) }
+        }
         default { $e = $s.AddDays(1) }
     }
     $cap = [DateTime]::Today.AddDays(1)
@@ -3590,9 +3810,15 @@ $script:ReportXaml = @'
         <TextBlock x:Name="RcCal" Text="📅" DockPanel.Dock="Right" Foreground="#FF8A93A6" FontFamily="Malgun Gothic" FontSize="13" Cursor="Hand" Padding="8,1,0,0" ToolTip="달력에서 기간 선택" ToolTipService.InitialShowDelay="0"/>
         <TextBlock x:Name="RcTitle" FontFamily="Malgun Gothic" FontSize="16" FontWeight="ExtraBold" Foreground="#FFF2F4F8"/>
       </DockPanel>
-      <Popup x:Name="RcCalPop" StaysOpen="False" AllowsTransparency="True" Placement="Bottom" PlacementTarget="{Binding ElementName=RcCal}">
+      <Popup x:Name="RcCalPop" StaysOpen="True" AllowsTransparency="True" Placement="Bottom" PlacementTarget="{Binding ElementName=RcCal}">
         <Border Background="#FF1C2233" CornerRadius="8" Padding="8" BorderBrush="#FF2E4266" BorderThickness="1">
-          <Calendar x:Name="RcCalendar"/>
+          <StackPanel>
+            <Calendar x:Name="RcCalendar"/>
+            <DockPanel x:Name="RcCalApplyRow" Visibility="Collapsed" Margin="2,6,2,0">
+              <TextBlock x:Name="RcCalApply" Text="적용" DockPanel.Dock="Right" FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="ExtraBold" Foreground="#FF7FB3FF" Cursor="Hand" Padding="10,0,2,0"/>
+              <TextBlock x:Name="RcCalHint" Text="시작일 클릭 후 종료일 클릭" FontFamily="Malgun Gothic" FontSize="11.5" FontWeight="Bold" Foreground="#FF8A93A6"/>
+            </DockPanel>
+          </StackPanel>
         </Border>
       </Popup>
       <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
@@ -3601,7 +3827,8 @@ $script:ReportXaml = @'
         <TextBlock x:Name="RcTabMonth" Text="월간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
         <TextBlock x:Name="RcTabSeason" Text="시즌" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
         <TextBlock x:Name="RcTabYear" Text="연간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
-        <TextBlock x:Name="RcTabAll" Text="전체" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand"/>
+        <TextBlock x:Name="RcTabAll" Text="전체" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
+        <TextBlock x:Name="RcTabRange" Text="기간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand"/>
       </StackPanel>
       <TextBlock x:Name="RcSeq" FontFamily="Malgun Gothic" FontSize="22" FontWeight="ExtraBold" Margin="0,12,0,0" Foreground="#FFF2F4F8"/>
       <TextBlock x:Name="RcStats" FontFamily="Malgun Gothic" FontSize="14" FontWeight="Bold" Foreground="#FFD9DCE1" Margin="0,8,0,0"/>
@@ -3631,9 +3858,45 @@ $script:ReportXaml = @'
 </Window>
 '@
 
+# 리포트 달력 팝업 열기 - 단일 날짜(기존 탭) 또는 범위 선택(기간 탭)
+function Open-ReportCalendar {
+    param($W, [string]$ForceMode = '')
+    $st = $W.Tag
+    $mode = [string]$st.Mode
+    if ($ForceMode) { $mode = $ForceMode }
+    $pop = $W.FindName('RcCalPop')
+    $cal = $W.FindName('RcCalendar')
+    $applyRow = $W.FindName('RcCalApplyRow')
+    $script:CalSyncing = $true
+    try {
+        $cal.DisplayDateEnd = [DateTime]::Today
+        if ($mode -eq 'range') {
+            $cal.SelectionMode = 'SelectedRange'
+            $applyRow.Visibility = 'Visible'
+            $cal.SelectedDates.Clear()
+            # 이전 범위가 있으면 미리 표시
+            if ($script:ReportRangeEnd -is [DateTime] -and $script:ReportAnchors.ContainsKey('range')) {
+                $rs = [DateTime]$script:ReportAnchors['range']
+                $re = [DateTime]$script:ReportRangeEnd
+                try { $cal.SelectedDates.AddRange($rs, $re) } catch {}
+                $cal.DisplayDate = $re
+            } else {
+                $cal.DisplayDate = [DateTime]::Today
+            }
+        } else {
+            $cal.SelectionMode = 'SingleDate'
+            $applyRow.Visibility = 'Collapsed'
+            $cal.SelectedDate = [DateTime]$st.Anchor
+            $cal.DisplayDate = [DateTime]$st.Anchor
+        }
+    } catch {}
+    $script:CalSyncing = $false
+    $pop.IsOpen = $true
+}
+
 function Set-ReportTabs {
     param($Rw, [string]$Mode)
-    $map = @{ day = 'RcTabDay'; week = 'RcTabWeek'; month = 'RcTabMonth'; season = 'RcTabSeason'; year = 'RcTabYear'; all = 'RcTabAll' }
+    $map = @{ day = 'RcTabDay'; week = 'RcTabWeek'; month = 'RcTabMonth'; season = 'RcTabSeason'; year = 'RcTabYear'; all = 'RcTabAll'; range = 'RcTabRange' }
     foreach ($m in $map.Keys) {
         $tb = $Rw.FindName($map[$m])
         if ($m -eq $Mode) { $tb.Opacity = 1.0; $tb.TextDecorations = [Windows.TextDecorations]::Underline }
@@ -4253,13 +4516,20 @@ function Fill-ReportContent {
 }
 
 function Request-Report {
-    param([string]$Mode, [DateTime]$Anchor)
+    param([string]$Mode, [DateTime]$Anchor, [DateTime]$RangeEnd = [DateTime]::MinValue)
     $rw = $script:ReportWin
     if (-not $rw) { return }
-    $rw.Tag = @{ Mode = $Mode; Anchor = $Anchor }
+    if ($Mode -eq 'range') {
+        if ($RangeEnd -eq [DateTime]::MinValue -and $script:ReportRangeEnd -is [DateTime]) { $RangeEnd = [DateTime]$script:ReportRangeEnd }
+        if ($RangeEnd -eq [DateTime]::MinValue) { $RangeEnd = $Anchor }
+        if ($RangeEnd -lt $Anchor) { $t0 = $Anchor; $Anchor = $RangeEnd; $RangeEnd = $t0 }
+        $script:ReportRangeEnd = $RangeEnd
+    }
+    $rw.Tag = @{ Mode = $Mode; Anchor = $Anchor; RangeEnd = $RangeEnd }
     $script:ReportAnchors[$Mode] = $Anchor
     Set-ReportTabs $rw $Mode
     $key = ('{0}|{1}' -f $Mode, $Anchor.ToString('yyyy-MM-dd'))
+    if ($Mode -eq 'range') { $key += ('|{0}' -f $RangeEnd.ToString('yyyy-MM-dd')) }
 
     # 오늘-일간은 라이브 데이터로 즉시 표시 (초기 로딩 전엔 라이브 데이터가 없으니 백그라운드 조회로)
     if ($Mode -eq 'day' -and $Anchor -eq [DateTime]::Today -and $script:LastData) {
@@ -4290,7 +4560,9 @@ function Request-Report {
     try { Remove-Item (Join-Path $PSScriptRoot 'report-result.json') -Force -ErrorAction SilentlyContinue } catch {}
     $script:ReportReqKey = $key
     $script:ReportStart = Get-Date
-    $script:ReportProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-ReportOnce', $Mode, $Anchor.ToString('yyyy-MM-dd')
+    $repArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-ReportOnce', $Mode, $Anchor.ToString('yyyy-MM-dd'))
+    if ($Mode -eq 'range') { $repArgs += $RangeEnd.ToString('yyyy-MM-dd') }
+    $script:ReportProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList $repArgs
     $script:ReportPollTimer.Start()
 }
 
@@ -4336,6 +4608,27 @@ function Show-ReportCard {
         foreach ($tn in @('RcTabDay', 'RcTabWeek', 'RcTabMonth', 'RcTabSeason', 'RcTabYear', 'RcTabAll')) {
             $rw.FindName($tn).Add_MouseLeftButtonDown($tabHandler)
         }
+        # '기간' 탭: 이전 범위가 있으면 바로 표시하고, 없으면 달력에서 범위 선택
+        $rw.FindName('RcTabRange').Add_MouseLeftButtonDown({
+            $args[1].Handled = $true
+            $w = [Windows.Window]::GetWindow($args[0])
+            if ($script:ReportRangeEnd -is [DateTime] -and $script:ReportAnchors.ContainsKey('range')) {
+                Request-Report 'range' ([DateTime]$script:ReportAnchors['range']) ([DateTime]$script:ReportRangeEnd)
+            }
+            Open-ReportCalendar $w 'range'
+        })
+        # 범위 '적용' 버튼
+        $rw.FindName('RcCalApply').Add_MouseLeftButtonDown({
+            $args[1].Handled = $true
+            $w = [Windows.Window]::GetWindow($args[0])
+            $cal = $w.FindName('RcCalendar')
+            $dates = @($cal.SelectedDates)
+            if ($dates.Count -eq 0) { return }
+            $s2 = ($dates | Measure-Object -Minimum).Minimum
+            $e2 = ($dates | Measure-Object -Maximum).Maximum
+            $w.FindName('RcCalPop').IsOpen = $false
+            Request-Report 'range' ([DateTime]$s2).Date ([DateTime]$e2).Date
+        })
         # ◀ ▶ 기간 이동
         $rw.FindName('RcPrev').Add_MouseLeftButtonDown({
             $args[1].Handled = $true
@@ -4344,6 +4637,12 @@ function Show-ReportCard {
             $m = [string]$st.Mode
             if ($m -eq 'all') { return }
             $a = [DateTime]$st.Anchor
+            if ($m -eq 'range') {
+                $re = [DateTime]$st.RangeEnd
+                $span = [math]::Max(1, ($re.Date - $a.Date).Days + 1)
+                Request-Report 'range' $a.AddDays(-$span) $re.AddDays(-$span)
+                return
+            }
             switch ($m) {
                 'week' { $a = $a.AddDays(-7) }
                 'season' { $a = $a.AddMonths(-3) }
@@ -4360,6 +4659,15 @@ function Show-ReportCard {
             $m = [string]$st.Mode
             if ($m -eq 'all') { return }
             $a = [DateTime]$st.Anchor
+            if ($m -eq 'range') {
+                $re = [DateTime]$st.RangeEnd
+                $span = [math]::Max(1, ($re.Date - $a.Date).Days + 1)
+                $ns = $a.AddDays($span); $ne = $re.AddDays($span)
+                if ($ns -gt [DateTime]::Today) { return }
+                if ($ne -gt [DateTime]::Today) { $ne = [DateTime]::Today }
+                Request-Report 'range' $ns $ne
+                return
+            }
             switch ($m) {
                 'week' { $a = $a.AddDays(7) }
                 'season' { $a = $a.AddMonths(3) }
@@ -4371,32 +4679,22 @@ function Show-ReportCard {
             if ($a -gt (Get-PeriodAnchor $m ([DateTime]::Today))) { return }
             Request-Report $m $a
         })
-        # 📅 달력에서 날짜를 골라 해당 기간으로 이동 (전체 탭 제외)
-        $rw.FindName('RcCalPop').Add_Closed({ $script:CalPopClosed = Get-Date })
+        # 📅 달력에서 날짜(또는 기간 모드에선 범위)를 골라 이동 (전체 탭 제외)
         $rw.FindName('RcCal').Add_MouseLeftButtonDown({
             $args[1].Handled = $true
             $w = [Windows.Window]::GetWindow($args[0])
             $st = $w.Tag
             if ([string]$st.Mode -eq 'all') { return }
             $pop = $w.FindName('RcCalPop')
-            # 팝업이 열린 상태에서 📅를 다시 누르면 바깥 클릭으로 이미 닫힌 직후라 재오픈 방지
             if ($pop.IsOpen) { $pop.IsOpen = $false; return }
-            if ($script:CalPopClosed -and ((Get-Date) - $script:CalPopClosed).TotalMilliseconds -lt 250) { return }
-            $cal = $w.FindName('RcCalendar')
-            $script:CalSyncing = $true
-            try {
-                $cal.DisplayDateEnd = [DateTime]::Today
-                $cal.SelectedDate = [DateTime]$st.Anchor
-                $cal.DisplayDate = [DateTime]$st.Anchor
-            } catch {}
-            $script:CalSyncing = $false
-            $pop.IsOpen = $true
+            Open-ReportCalendar $w
         })
         $rw.FindName('RcCalendar').Add_SelectedDatesChanged({
             if ($script:CalSyncing) { return }
             # 달력이 마우스를 붙잡고 있으면 다음 클릭이 먹히는 WPF 버그 해제
             try { [Windows.Input.Mouse]::Capture($null) } catch {}
             $cal = $args[0]
+            if ([string]$cal.SelectionMode -ne 'SingleDate') { return }   # 범위 모드는 '적용' 버튼으로
             if ($null -eq $cal.SelectedDate) { return }
             $d = ([DateTime]$cal.SelectedDate).Date
             $w = $script:ReportWin

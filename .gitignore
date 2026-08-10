@@ -9,3 +9,5 @@ scan-plate-*.png
 *.zip
 install-ocr-zh.ps1
 scan-box.json
+engine/
+paddle-debug.txt
