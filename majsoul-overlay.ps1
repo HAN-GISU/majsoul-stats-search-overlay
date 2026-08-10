@@ -3495,7 +3495,12 @@ function Apply-Nickname {
     $script:LastData = $null
     $script:Settings.Nickname = $NewNick
     Save-Pos
-    if ($script:MyBox) { $script:MyBox.SetupPanel.Visibility = 'Collapsed' }
+    if ($script:MyBox) {
+        $script:MyBox.SetupPanel.Visibility = 'Collapsed'
+        # 재조회는 수 초~수십 초 걸림(오늘 순위 복원 포함) - 그동안 상태를 보여줘야 멈춘 것처럼 안 보임
+        $script:MyBox.TbName.Text = $NewNick
+        $script:MyBox.TbRank.Text = '⏳ 전적 불러오는 중...'
+    }
     Show-Toast "닉네임 설정: $NewNick" $true
     Update-Overlay
 }
@@ -5983,6 +5988,8 @@ function Update-Overlay {
         $my.TbGame.Text = ''
         foreach ($t in @($my.TbGoal, $my.TbStat, $my.TbStat2, $my.TbStat3, $my.TbStat4, $my.TbStat5)) { if ($t) { $t.Text = '' } }
         try { $my.SparkCanvas.Children.Clear() } catch {}
+        # 미설정 상태에서는 입력칸이 항상 보여야 함
+        if ($my.SetupPanel.Visibility -ne 'Visible') { $my.SetupPanel.Visibility = 'Visible' }
         return
     }
     if ($script:NetBusy) { return }   # 갱신 중 타이머/버튼 재진입 방지
