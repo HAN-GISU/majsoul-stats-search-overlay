@@ -1,6 +1,6 @@
 ﻿# 작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
 
-**v1.0.6** · © 2026 [HAN-GISU](https://github.com/HAN-GISU) · MIT License
+**v1.1.0** · © 2026 [HAN-GISU](https://github.com/HAN-GISU) · MIT License
 
 작혼(Mahjong Soul) 게임 화면 위에 나와 상대의 전적을 실시간으로 띄워주는 Windows 오버레이입니다.
 게임 파일이나 통신에 일절 개입하지 않고 화면 위에 창을 얹는 방식입니다.
@@ -17,12 +17,14 @@
 ## 설치
 
 > 요구 사항: Windows 10/11. 기본 기능은 별도 설치 없이 동작합니다.
+> ※ 전적 데이터 특성상 **4인 금의 방(금탁) 이상 단위전** 기록이 있는 계정만 조회됩니다 — 본인·상대 모두. 은/동의 방에서만 친 계정은 표시되지 않습니다.
 
 1. [Releases](../../releases)에서 ZIP을 받아 압축 해제
    - **엔진 포함판** `...-full.zip` (권장) — 인식 엔진이 들어 있어 압축만 풀면 끝
    - 경량판 `...zip` — 용량이 작은 대신 인식 엔진은 별도 설치(아래 참고)
-2. `overlay-start.bat` 더블클릭
+2. `작혼 오버레이.exe` 더블클릭
    - "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**
+   - 실행이 막히면 `tools\overlay-start.bat`으로도 켤 수 있습니다
 3. 박스에 나타나는 **작혼 닉네임 입력칸**에 본인 닉네임을 넣고 확인
    - 이후 변경은 설정(톱니 버튼)의 "내 닉네임"에서 가능
 
@@ -40,14 +42,14 @@
 
 #### 엔진 없이 쓰기 (대안)
 
-엔진이 없으면 Windows 내장 문자인식으로 동작합니다. 이 경우 외국어 닉네임 인식을 위해 `install-ocr.bat`을 더블클릭하고 UAC에서 "예"를 누르세요. ⚠ 설치 창 안을 클릭하지 마세요 (일시정지됨 — 멈춘 것 같으면 Esc). Windows 공식 언어 구성요소만 설치되며 시스템 언어/키보드 설정은 바뀌지 않습니다.
+엔진이 없으면 Windows 내장 문자인식으로 동작합니다. 이 경우 외국어 닉네임 인식을 위해 `tools` 폴더의 `install-ocr.bat`을 더블클릭하고 UAC에서 "예"를 누르세요. ⚠ 설치 창 안을 클릭하지 마세요 (일시정지됨 — 멈춘 것 같으면 Esc). Windows 공식 언어 구성요소만 설치되며 시스템 언어/키보드 설정은 바뀌지 않습니다.
 
 ### 스팀 연동 (선택)
 
 스팀 라이브러리에서 작혼 우클릭 → 속성 → **시작 옵션**에 아래 한 줄 (경로는 본인 폴더로 수정):
 
 ```
-powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경로\majsoul-overlay\steam-launch.ps1" %command%
+powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경로\majsoul-overlay\tools\steam-launch.ps1" %command%
 ```
 
 ## 사용법
@@ -68,7 +70,7 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경�
 
 전적 데이터는 서드파티 통계 사이트 [amae-koromo (雀魂牌谱屋)](https://amae-koromo.sapk.ch/)의 공개 API에서 가져옵니다.
 
-- 대국 종료 후 사이트 반영까지 **보통 5~15분, 길면 수십 분** 걸릴 수 있습니다. 오버레이는 30초마다 확인하므로 사이트에 뜨는 즉시 반영됩니다.
+- 대국 종료 후 사이트 반영까지 **보통 5~15분, 길면 수십 분** 걸릴 수 있습니다. 오버레이는 1분마다 확인하므로 사이트에 뜨는 즉시 반영됩니다.
 - 집계 범위는 4인 금의 방 이상 단위전입니다. 은/동의 방, 3인, 이벤트 대국은 포함되지 않으며, 금의 방 기록이 없는 유저는 검색되지 않습니다.
 - 통계 기준(전체 / 최근 N개월 / 최근 N국)은 설정에서 나와 상대 각각 바꿀 수 있습니다.
 - 안정단위는 기준 구간에서 가장 많이 친 모드(주력 모드)의 통계만으로 계산하며, 라벨에 그 모드를 병기합니다 (예: `금남·1개월 기준`).
