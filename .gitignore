@@ -1,6 +1,9 @@
-# 개인 설정/로그/결과물 (공유 금지)
+# 개인 설정/로그/결과물 (공유 금지) - 런타임 파일은 data\ 아래로 생성됨
+data/
+*.lnk
+*.exe
 overlay-pos.json
-scan-log.txt
+scan-log*.txt
 scan-result.json
 report-result.json
 detail-result.json
