@@ -1,6 +1,6 @@
 ﻿# ═══════════════════════════════════════════════════════════
 #  작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
-#  v1.1.1  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
+#  v1.1.2  |  © 2026 HAN-GISU (github.com/HAN-GISU)  |  MIT License
 #  데이터: amae-koromo(雀魂牌谱屋) 공개 API — 게임에 개입하지 않음
 # ═══════════════════════════════════════════════════════════
 
@@ -106,7 +106,7 @@ $script:Settings = @{
     TextColorLight = ''; TextColorDark = ''; TextColorTrans = ''
     BgColorLight = ''; BgColorDark = ''; BgColorTrans = ''
     BgAlphaLight = -1; BgAlphaDark = -1; BgAlphaTrans = -1
-    MyBasis = 'm1'; OppBasis = 'm1'; MyStatScope = 'all'; OppStatScope = 'all'; KeyScan = 'F8'; KeyClose = 'F7'; KeyExit = 'F10'; DailyGoal = 0
+    MyBasis = 'm1'; OppBasis = 'm1'; MyStatScope = 'all'; OppStatScope = 'all'; KeyScan = 'F8'; KeyClose = 'F7'; KeyExit = 'F10'; KeySet = 'F11'; DailyGoal = 0
 }
 $script:Presets = @{}     # 이름 -> @{ Theme; Settings }
 $script:OppCache = @{}    # id -> 전적 데이터
@@ -851,7 +851,7 @@ function Get-PtAt {
 
 # 리포트 팩 생성 (일/주/월/년/전체) - 백그라운드 프로세스에서 호출됨
 function Build-ReportPack {
-    param([string]$Mode, [DateTime]$Anchor, [DateTime]$RangeEnd = [DateTime]::MinValue)
+    param([string]$Mode, [DateTime]$Anchor, [DateTime]$RangeEnd = [DateTime]::MinValue, [string]$Gran = '')
     $id = Get-PlayerId
     $today = [DateTime]::Today
     if ($Mode -eq 'day') {
@@ -944,10 +944,48 @@ function Build-ReportPack {
             $title = ('{0}/{1}~{2}/{3}' -f $s.Month, $s.Day, $e.Month, $e.Day)
         }
     } elseif ($Mode -eq 'all') {
-        # 전체 기간 = 연도별 버킷 (amae-koromo 데이터가 존재하는 2018년부터, 빈 앞구간은 아래서 잘라냄)
-        $s = New-Object DateTime 2018, 1, 1
-        $bounds = @(); for ($y = 2018; $y -le ($today.Year + 1); $y++) { $bounds += (New-Object DateTime $y, 1, 1) }
-        $labels = @(2018..$today.Year | ForEach-Object { [string]$_ })
+        # 전체 기간: 주식 차트처럼 봉 단위 선택 (주봉/월봉/연봉, 기본 월봉)
+        $g = $Gran
+        if ($g -ne 'week' -and $g -ne 'year') { $g = 'month' }
+        # 주/월봉은 먼저 연 단위로 첫 기록 연도를 찾아 범위를 좁힘 (2018년부터 빈 구간을 잘게 훑는 낭비 방지)
+        $firstY = 2018
+        if ($g -ne 'year') {
+            for ($y = 2018; $y -le $today.Year; $y++) {
+                $ys9 = New-Object DateTime $y, 1, 1
+                $stY = Get-RangeStats $id ([DateTimeOffset]::new($ys9).ToUnixTimeMilliseconds()) ([DateTimeOffset]::new($ys9.AddYears(1)).ToUnixTimeMilliseconds())
+                Start-Sleep -Milliseconds 60
+                $firstY = $y
+                if ($stY -and [int]$stY.count -gt 0) { break }
+            }
+        }
+        if ($g -eq 'year') {
+            $s = New-Object DateTime 2018, 1, 1
+            $bounds = @(); for ($y = 2018; $y -le ($today.Year + 1); $y++) { $bounds += (New-Object DateTime $y, 1, 1) }
+            $labels = @(2018..$today.Year | ForEach-Object { [string]$_ })
+        } elseif ($g -eq 'week') {
+            # 주봉: 최근 60주 (첫 기록 이후로 한정), 월요일 경계
+            $wEnd = $today.Date.AddDays(-(([int]$today.DayOfWeek + 6) % 7)).AddDays(7)
+            $ws = $wEnd.AddDays(-7 * 60)
+            $f0 = New-Object DateTime $firstY, 1, 1
+            $f0 = $f0.AddDays(-(([int]$f0.DayOfWeek + 6) % 7))
+            if ($ws -lt $f0) { $ws = $f0 }
+            $s = $ws
+            $bounds = @(); $labels = @()
+            $d = $ws
+            while ($d -lt $wEnd) { $bounds += $d; $labels += ('{0}/{1}' -f $d.Month, $d.Day); $d = $d.AddDays(7) }
+            $bounds += $wEnd
+        } else {
+            # 월봉(기본): 첫 기록 연도부터 이번 달까지, 최대 60개월
+            $mEnd = (New-Object DateTime $today.Year, $today.Month, 1).AddMonths(1)
+            $ms0 = New-Object DateTime $firstY, 1, 1
+            $minS = $mEnd.AddMonths(-60)
+            if ($ms0 -lt $minS) { $ms0 = $minS }
+            $s = $ms0
+            $bounds = @(); $labels = @()
+            $d = $ms0
+            while ($d -lt $mEnd) { $bounds += $d; $labels += ('{0:yy}/{1}' -f $d, $d.Month); $d = $d.AddMonths(1) }
+            $bounds += $mEnd
+        }
         $title = '전체'
     } else {
         $s = New-Object DateTime $Anchor.Year, 1, 1
@@ -989,7 +1027,9 @@ function Build-ReportPack {
     if ($Mode -eq 'all') {
         while ($buckets.Count -gt 1 -and [int]$buckets[0].N -eq 0) { $buckets = @($buckets | Select-Object -Skip 1) }
     }
-    return @{ Mode = $Mode; Anchor = $s.ToString('yyyy-MM-dd'); Title = $title; N = $nTotal; Diff = $diffTotal; RankCounts = $rcTotal; Seq = @(); Pts = @(); Buckets = $buckets; StartLvl = $startLvl; StartPt = $startPt; EndLvl = $curLvlId; EndPt = $endPt }
+    $granOut = ''
+    if ($Mode -eq 'all') { $granOut = $g }
+    return @{ Mode = $Mode; Anchor = $s.ToString('yyyy-MM-dd'); Title = $title; N = $nTotal; Diff = $diffTotal; RankCounts = $rcTotal; Seq = @(); Pts = @(); Buckets = $buckets; StartLvl = $startLvl; StartPt = $startPt; EndLvl = $curLvlId; EndPt = $endPt; Gran = $granOut }
 }
 
 # 스트릭: 연대율 기준 — 1·2위 = 연대, 4위 = 라스(연속 라스)
@@ -2449,11 +2489,11 @@ function Find-ByPrefix {
     if ($Raw.Length -gt 16) { return $false }
     $pres = New-Object Collections.ArrayList
     $c1 = $Raw.Substring(0, 1)
-    $isCjk = ($c1 -match '^[぀-ヿ一-鿿]$')
+    $isCjk = ($c1 -match '^[぀-ヿ一-鿿가-힣]$')
     # CJK는 2글자부터(한자 닉은 짧음), 라틴은 3글자부터
     if (($isCjk -and $Raw.Length -lt 2) -or (-not $isCjk -and $Raw.Length -lt 3)) { return $false }
     if ($isCjk) {
-        $has2 = ($Raw.Substring(0, 2) -match '^[぀-ヿ一-鿿]{2}$')
+        $has2 = ($Raw.Substring(0, 2) -match '^[぀-ヿ一-鿿가-힣]{2}$')
         if ($has2) { $null = $pres.Add($Raw.Substring(0, 2)) }
         # 접두 자체가 오인식됐을 수 있음: 첫/둘째 글자의 가나 혼동쌍 조합도 접두 후보로
         # (리터럴 접두 검색이라 えい로는 えぃ~ 닉을 못 가져옴)
@@ -2532,6 +2572,9 @@ function Test-NickPlausible {
     }
     if ($T -match '^[\d.,:%/()\-±▲▼xX×*·。、]+$') { return $false }
     if ($T -imatch '^([a-z0-9])\1+$') { return $false }
+    # 후로/패산이 글자로 읽힌 잡음: 패 이름 문자로만 이뤄진 토큰 (西西西 폰이 실존 계정 西西西와 정확 일치했던 사고)
+    # 명패 위치(Lenient)에서는 허용 - 진짜 그런 닉이 앉아 있을 수 있음
+    if ($T -match '^[東南西北白發中一二三四五六七八九萬筒索]+$') { return $false }
     # 한글 + 라틴/숫자 혼합은 대부분 OCR 잡음
     if ($T -match '[가-힣]' -and $T -match '[A-Za-z0-9]') { return $false }
     # 숫자·기호 비중이 과반이면 잡음 (단 물결표는 일본어 닉에 흔해서 가나·한자 토큰에선 세지 않음)
@@ -2634,9 +2677,9 @@ function Resolve-Tokens {
             $vlist = Get-TokenVariants $raw $deep
         }
         foreach ($t in $vlist) {
-            # 최소 길이: 한자/가나 2글자, 명패 라틴 3글자, 그 외 4글자
+            # 최소 길이: 한자/가나/한글 2글자, 명패 라틴 3글자, 그 외 4글자 (빨곰 - 2글자 한글 닉)
             $minLen = 4
-            if ($t -match '[぀-ヿ一-鿿]') { $minLen = 2 }
+            if ($t -match '[぀-ヿ一-鿿가-힣]') { $minLen = 2 }
             elseif ($tk.Src -eq 'p') { $minLen = 3 }
             if ($t.Length -lt $minLen -or $t.Length -gt 16) { continue }
             if ($t -eq $myNick) { $script:SawMyNick = $true; continue }
@@ -2716,7 +2759,7 @@ function Resolve-Tokens {
 
         # 변형으로도 못 찾았고 명패에서 읽힌 토큰이면 접두사 유사매칭 시도 (2단계에서만)
         # CJK 시작(중간 장식 닉 '猫・ROBIN'도 구제) 또는 라틴 3글자 시작(선두 장식 채널: 丶Aaron ← Aaron)
-        if ($phase -eq 1 -and $tk.Src -eq 'p' -and ($raw -match '^[぀-ヿ一-鿿]' -or $raw -cmatch '^[A-Za-z]{3}')) {
+        if ($phase -eq 1 -and $tk.Src -eq 'p' -and ($raw -match '^[぀-ヿ一-鿿가-힣]' -or $raw -cmatch '^[A-Za-z]{3}')) {
             $already = $false
             foreach ($kv in @($FoundMap.GetEnumerator())) {
                 if ([math]::Abs([double]$kv.Value.X - [double]$tk.X) -lt 240 -and [math]::Abs([double]$kv.Value.Y - [double]$tk.Y) -lt 60) { $already = $true; break }
@@ -3057,7 +3100,9 @@ if ($riIdx -ge 0) {
     if ($rMode -eq 'range' -and $args.Count -gt ($riIdx + 3)) {
         $rEnd2 = [DateTime]::ParseExact([string]$args[$riIdx + 3], 'yyyy-MM-dd', $null)
     }
-    $pack = Build-ReportPack $rMode $rAnchor $rEnd2
+    $rGran = ''
+    if ($rMode -eq 'all' -and $args.Count -gt ($riIdx + 3)) { $rGran = [string]$args[$riIdx + 3] }
+    $pack = Build-ReportPack $rMode $rAnchor $rEnd2 $rGran
     ConvertTo-Json -InputObject $pack -Depth 6 | Out-File (Join-Path $script:DataDir 'report-result.json') -Encoding utf8
     exit 0
 }
@@ -3084,7 +3129,8 @@ if ($diIdx -ge 0) {
     exit 0
 }
 
-# 내부 테스트: 상대 데이터 조립 경로 단독 실행 (-TestOpp <id> [room])
+# 내부 테스트: 상대 데이터 조립 경로 단독 실행 (-TestOpp <id> [room] [full])
+# 'full'을 붙이면 안정단위 계산까지 포함 (기본은 스캔 1차와 같은 -SkipStable)
 if ($args.Count -ge 2 -and $args[0] -eq '-TestOpp') {
     try {
         $pos = Get-Content (Join-Path $script:DataDir 'overlay-pos.json') -Raw | ConvertFrom-Json
@@ -3096,7 +3142,8 @@ if ($args.Count -ge 2 -and $args[0] -eq '-TestOpp') {
     $script:ScanRoomMode = 8
     if ($args.Count -ge 3) { $script:ScanRoomMode = [int]$args[2] }
     $script:SawMyNick = $true
-    $d = Get-OpponentData ([long]$args[1]) -SkipStable
+    if ($args -contains 'full') { $d = Get-OpponentData ([long]$args[1]) }
+    else { $d = Get-OpponentData ([long]$args[1]) -SkipStable }
     if ($d) { $d | Format-List } else { '(null)' }
     exit 0
 }
@@ -3304,6 +3351,10 @@ $BoxXaml = @'
             <TextBlock x:Name="TbKeyExitL" Text="종료 키 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100"/>
             <ComboBox x:Name="CmbKeyExit" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
           </StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,2,0,1">
+            <TextBlock x:Name="TbKeySetL" Text="설정 키 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100" ToolTip="설정 창 열기/닫기 (배경 투명도 0으로 ⚙를 못 누르게 됐을 때의 비상구이기도 함)" ToolTipService.InitialShowDelay="0"/>
+            <ComboBox x:Name="CmbKeySet" FontFamily="Malgun Gothic" FontSize="12" Width="105"/>
+          </StackPanel>
           <StackPanel Orientation="Horizontal" Margin="0,6,0,1">
             <TextBlock x:Name="TbSizeTgtL" Text="크기·비율 대상 " FontFamily="Malgun Gothic" FontSize="12.5" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Width="100" ToolTip="아래 크기·글자·비율 설정을 어느 박스에 적용할지" ToolTipService.InitialShowDelay="0"/>
             <TextBlock x:Name="TbSizeTgtMe" Text="내 박스" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FF16213E" VerticalAlignment="Center" Cursor="Hand" Margin="0,0,12,0"/>
@@ -3401,11 +3452,78 @@ $BoxXaml = @'
 
 $OppXaml = $BoxXaml -replace 'FontSize="17"', 'FontSize="14"' -replace 'FontSize="15"', 'FontSize="12.5"' -replace 'Padding="16,10"', 'Padding="12,7"'
 
+# 설정 창 열기/닫기 토글 - ⚙ 버튼과 설정 단축키(KeySet)가 공유
+# (배경 투명도를 0에 가깝게 해 버튼을 못 누르게 됐을 때의 비상구 역할도 함)
+function Toggle-SettingsWin {
+    param($b)
+    if (-not $b) { $b = $script:MyBox }
+    if (-not $b -or -not $b.CbToast) { return }
+    if ($script:SettingsWin -and $script:SettingsWin.IsVisible) {
+        $script:SettingsWin.Hide()
+        return
+    }
+    $script:SyncingUI = $true
+    $b.CbToast.IsChecked = [bool]$script:Settings.Toast
+    $b.CbMortal.IsChecked = [bool]$script:Settings.MortalWatch
+    $b.CbAnom.IsChecked = [bool]$script:Settings.Anom
+    $b.CmbAnomMode.SelectedIndex = $(if ([string]$script:Settings.AnomMode -eq 'static') { 1 } else { 0 })
+    $b.SwHigh.Background = New-Brush ([string]$script:Settings.AnomHigh)
+    $b.SwLow.Background = New-Brush ([string]$script:Settings.AnomLow)
+    # 설정 창을 열 때 고급 설정 패널들은 항상 접힌 상태로 시작
+    foreach ($ap in @(@($b.AdvPanel, $b.BtnAdv), @($b.BadgePanel, $b.BtnBadgeAdv), @($b.StablePanel, $b.BtnStableAdv))) {
+        if ($ap[0]) { $ap[0].Visibility = 'Collapsed' }
+        if ($ap[1]) { $ap[1].Text = '고급 설정 ▾' }
+    }
+    Build-DispPanel $b
+    $b.TxNick.Text = [string]$script:Nickname
+    $codes = @('all', 'm1', 'm3', 'm6', 'y1', 'g50', 'g100', 'g200', 'base')
+    $iMy = [Array]::IndexOf($codes, [string]$script:Settings.MyBasis)
+    $iOpp = [Array]::IndexOf($codes, [string]$script:Settings.OppBasis)
+    $b.CmbBasisMy.SelectedIndex = [math]::Max(0, $iMy)
+    $b.CmbBasisOpp.SelectedIndex = [math]::Max(0, $iOpp)
+    $b.CmbKeyScan.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:KeyOptions, [string]$script:Settings.KeyScan))
+    $b.CmbKeyClose.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:KeyOptions, [string]$script:Settings.KeyClose))
+    $b.CmbKeyExit.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:KeyOptions, [string]$script:Settings.KeyExit))
+    $b.CmbKeySet.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:KeyOptions, [string]$script:Settings.KeySet))
+    $b.CmbGoal.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:GoalOptions, [int]$script:Settings.DailyGoal))
+    $b.CmbBase.SelectedIndex = [math]::Max(0, [Array]::IndexOf(@('today', 'session', 'custom'), [string]$script:Settings.SessionBase))
+    Sync-BasePanel $b
+    $b.CmbMinN.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:MinNOptions, [int]$script:Settings.OppMinN))
+    $b.CmbStatScope.SelectedIndex = [math]::Max(0, [Array]::IndexOf(@('all', 'room', 'dom', 'stable', '9.8', '12.11', '16.15'), [string]$script:Settings.OppStatScope))
+    $b.CmbMyScope.SelectedIndex = [math]::Max(0, [Array]::IndexOf(@('all', 'dom', 'stable', '9.8', '12.11', '16.15'), [string]$script:Settings.MyStatScope))
+    Sync-RatioUi   # 크기 콤보·글자·비율 3종을 현재 편집 대상 값으로 (대상 링크 시각 포함)
+    $b.CbBadge.IsChecked = [bool]$script:Settings.BadgeOn
+    $script:SyncingUI = $false
+    Sync-SettingSections
+    Sync-TxtColSwatch
+    Sync-PresetList $b
+    if ($b.BadgePanel.Visibility -eq 'Visible') { Build-BadgePanel $b }
+    if ($script:SettingsWin) {
+        # 메인 박스 오른쪽에 붙여 표시 (화면 밖이면 왼쪽)
+        $mw = $b.Win
+        $script:SettingsWin.Left = $mw.Left + $mw.ActualWidth + 8
+        $script:SettingsWin.Top = $mw.Top
+        $script:SettingsWin.Show()
+        $script:SettingsWin.UpdateLayout()
+        $vw = [Windows.SystemParameters]::VirtualScreenWidth
+        if ($script:SettingsWin.Left + $script:SettingsWin.ActualWidth -gt $vw) {
+            $script:SettingsWin.Left = [math]::Max(0, $mw.Left - $script:SettingsWin.ActualWidth - 8)
+        }
+        $vh = [Windows.SystemParameters]::VirtualScreenHeight
+        if ($script:SettingsWin.Top + $script:SettingsWin.ActualHeight -gt $vh) {
+            $script:SettingsWin.Top = [math]::Max(0, $vh - $script:SettingsWin.ActualHeight - 8)
+        }
+    } else {
+        $b.SettingsPanel.Visibility = 'Visible'
+    }
+}
+
 function Get-HelpText {
     $ks = $script:Settings.KeyScan
     $kc = $script:Settings.KeyClose
     $ke = $script:Settings.KeyExit
-    return "$ks : 화면 스캔 - 상대 전적 표시`r`n$kc : 상대 박스 모두 닫기`r`n$ke : 오버레이 종료`r`n드래그 : 위치 이동`r`n⟳ : 즉시 새로고침`r`n⚙ : 기능 켜기/끄기·키 설정`r`n◐ : 테마 전환 (밝은 / 다크 / 투명)`r`n? : 이 도움말 접기/펴기`r`n`r`n[안정단위] 지금 성적(순위 분포·평균점수)을 계속 유지하면`r`n최종적으로 정착하게 될 단위의 추정치 (옥남 기준, 牌谱屋 공식)`r`n· 작호2.31 = 작호2~3에 정착할 실력`r`n· 작호4 이상 = 작성급 → 작성1.20처럼 표시`r`n· 음수(작호-0.47) = 아직 작호 유지선 아래 (작걸대는 대부분 음수~1)"
+    $kt = $script:Settings.KeySet
+    return "$ks : 화면 스캔 - 상대 전적 표시`r`n$kc : 상대 박스 모두 닫기`r`n$ke : 오버레이 종료`r`n$kt : 설정 열기/닫기`r`n드래그 : 위치 이동`r`n⟳ : 즉시 새로고침`r`n⚙ : 기능 켜기/끄기·키 설정`r`n◐ : 테마 전환 (밝은 / 다크 / 투명)`r`n? : 이 도움말 접기/펴기`r`n`r`n[안정단위] 지금 성적(순위 분포·평균점수)을 계속 유지하면`r`n최종적으로 정착하게 될 단위의 추정치 (옥남 기준, 牌谱屋 공식)`r`n· 작호2.31 = 작호2~3에 정착할 실력`r`n· 작호4 이상 = 작성급 → 작성1.20처럼 표시`r`n· 음수(작호-0.47) = 아직 작호 유지선 아래 (작걸대는 대부분 음수~1)"
 }
 
 function Update-HelpTexts {
@@ -3593,6 +3711,8 @@ function New-StatWindow {
         CmbKeyScan = $w.FindName('CmbKeyScan')
         CmbKeyClose = $w.FindName('CmbKeyClose')
         CmbKeyExit = $w.FindName('CmbKeyExit')
+        TbKeySetL = $w.FindName('TbKeySetL')
+        CmbKeySet = $w.FindName('CmbKeySet')
         TbGoalL = $w.FindName('TbGoalL')
         CmbGoal = $w.FindName('CmbGoal')
         TbBaseL = $w.FindName('TbBaseL')
@@ -3663,7 +3783,7 @@ function New-StatWindow {
         BtnPresetDel = $w.FindName('BtnPresetDel')
         LnkSource = $w.FindName('LnkSource')
     }
-    foreach ($cmb in @($box.CmbKeyScan, $box.CmbKeyClose, $box.CmbKeyExit)) {
+    foreach ($cmb in @($box.CmbKeyScan, $box.CmbKeyClose, $box.CmbKeyExit, $box.CmbKeySet)) {
         foreach ($k in $script:KeyOptions) { $null = $cmb.Items.Add($k) }
     }
     foreach ($g in $script:GoalOptions) {
@@ -3752,64 +3872,7 @@ function New-StatWindow {
     $box.BtnSettings.Tag = $box
     $box.BtnSettings.Add_MouseLeftButtonDown({
         $args[1].Handled = $true
-        $b = $args[0].Tag
-        if ($script:SettingsWin -and $script:SettingsWin.IsVisible) {
-            $script:SettingsWin.Hide()
-        } else {
-            $script:SyncingUI = $true
-            $b.CbToast.IsChecked = [bool]$script:Settings.Toast
-            $b.CbMortal.IsChecked = [bool]$script:Settings.MortalWatch
-            $b.CbAnom.IsChecked = [bool]$script:Settings.Anom
-            $b.CmbAnomMode.SelectedIndex = $(if ([string]$script:Settings.AnomMode -eq 'static') { 1 } else { 0 })
-            $b.SwHigh.Background = New-Brush ([string]$script:Settings.AnomHigh)
-            $b.SwLow.Background = New-Brush ([string]$script:Settings.AnomLow)
-            # 설정 창을 열 때 고급 설정 패널들은 항상 접힌 상태로 시작
-            foreach ($ap in @(@($b.AdvPanel, $b.BtnAdv), @($b.BadgePanel, $b.BtnBadgeAdv), @($b.StablePanel, $b.BtnStableAdv))) {
-                if ($ap[0]) { $ap[0].Visibility = 'Collapsed' }
-                if ($ap[1]) { $ap[1].Text = '고급 설정 ▾' }
-            }
-            Build-DispPanel $b
-            $b.TxNick.Text = [string]$script:Nickname
-            $codes = @('all', 'm1', 'm3', 'm6', 'y1', 'g50', 'g100', 'g200', 'base')
-            $iMy = [Array]::IndexOf($codes, [string]$script:Settings.MyBasis)
-            $iOpp = [Array]::IndexOf($codes, [string]$script:Settings.OppBasis)
-            $b.CmbBasisMy.SelectedIndex = [math]::Max(0, $iMy)
-            $b.CmbBasisOpp.SelectedIndex = [math]::Max(0, $iOpp)
-            $b.CmbKeyScan.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:KeyOptions, [string]$script:Settings.KeyScan))
-            $b.CmbKeyClose.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:KeyOptions, [string]$script:Settings.KeyClose))
-            $b.CmbKeyExit.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:KeyOptions, [string]$script:Settings.KeyExit))
-            $b.CmbGoal.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:GoalOptions, [int]$script:Settings.DailyGoal))
-            $b.CmbBase.SelectedIndex = [math]::Max(0, [Array]::IndexOf(@('today', 'session', 'custom'), [string]$script:Settings.SessionBase))
-            Sync-BasePanel $b
-            $b.CmbMinN.SelectedIndex = [math]::Max(0, [Array]::IndexOf($script:MinNOptions, [int]$script:Settings.OppMinN))
-            $b.CmbStatScope.SelectedIndex = [math]::Max(0, [Array]::IndexOf(@('all', 'room', 'dom', 'stable', '9.8', '12.11', '16.15'), [string]$script:Settings.OppStatScope))
-            $b.CmbMyScope.SelectedIndex = [math]::Max(0, [Array]::IndexOf(@('all', 'dom', 'stable', '9.8', '12.11', '16.15'), [string]$script:Settings.MyStatScope))
-            Sync-RatioUi   # 크기 콤보·글자·비율 3종을 현재 편집 대상 값으로 (대상 링크 시각 포함)
-            $b.CbBadge.IsChecked = [bool]$script:Settings.BadgeOn
-            $script:SyncingUI = $false
-            Sync-SettingSections
-            Sync-TxtColSwatch
-            Sync-PresetList $b
-            if ($b.BadgePanel.Visibility -eq 'Visible') { Build-BadgePanel $b }
-            if ($script:SettingsWin) {
-                # 메인 박스 오른쪽에 붙여 표시 (화면 밖이면 왼쪽)
-                $mw = $b.Win
-                $script:SettingsWin.Left = $mw.Left + $mw.ActualWidth + 8
-                $script:SettingsWin.Top = $mw.Top
-                $script:SettingsWin.Show()
-                $script:SettingsWin.UpdateLayout()
-                $vw = [Windows.SystemParameters]::VirtualScreenWidth
-                if ($script:SettingsWin.Left + $script:SettingsWin.ActualWidth -gt $vw) {
-                    $script:SettingsWin.Left = [math]::Max(0, $mw.Left - $script:SettingsWin.ActualWidth - 8)
-                }
-                $vh = [Windows.SystemParameters]::VirtualScreenHeight
-                if ($script:SettingsWin.Top + $script:SettingsWin.ActualHeight -gt $vh) {
-                    $script:SettingsWin.Top = [math]::Max(0, $vh - $script:SettingsWin.ActualHeight - 8)
-                }
-            } else {
-                $b.SettingsPanel.Visibility = 'Visible'
-            }
-        }
+        Toggle-SettingsWin $args[0].Tag
     })
     # 체크박스 토글 → 설정 저장 + 즉시 반영 (설정 키는 Tag에 저장)
     $box.CbToast.Tag = 'Toast'
@@ -3883,6 +3946,7 @@ function New-StatWindow {
     $box.CmbKeyScan.Tag = 'KeyScan'
     $box.CmbKeyClose.Tag = 'KeyClose'
     $box.CmbKeyExit.Tag = 'KeyExit'
+    $box.CmbKeySet.Tag = 'KeySet'
     $keyHandler = {
         if ($script:SyncingUI) { return }
         $s = $args[0]
@@ -3894,6 +3958,7 @@ function New-StatWindow {
     $box.CmbKeyScan.Add_SelectionChanged($keyHandler)
     $box.CmbKeyClose.Add_SelectionChanged($keyHandler)
     $box.CmbKeyExit.Add_SelectionChanged($keyHandler)
+    $box.CmbKeySet.Add_SelectionChanged($keyHandler)
     # 오늘 목표 변경
     $box.CmbGoal.Add_SelectionChanged({
         if ($script:SyncingUI) { return }
@@ -4262,7 +4327,8 @@ function Apply-Theme {
             $rgb = $base
             if ($bgc) { $rgb = [Windows.Media.ColorConverter]::ConvertFromString($bgc) }
             $a = $base.A
-            if ($bga -ge 0) { $a = [byte][math]::Round(255.0 * $bga / 100.0) }
+            # 최소 알파 1: 완전 투명(0)이면 히트테스트가 죽어 ⚙ 등 버튼을 다시는 못 누름
+            if ($bga -ge 0) { $a = [byte][math]::Max(1, [math]::Round(255.0 * $bga / 100.0)) }
             $bg = ('#{0:X2}{1:X2}{2:X2}{3:X2}' -f $a, $rgb.R, $rgb.G, $rgb.B)
         } catch {}
     }
@@ -4295,7 +4361,7 @@ function Apply-Theme {
                       $Box.BtnHelp, $Box.BtnSettings, $Box.BtnTheme, $Box.BtnReport, $Box.BtnScan, $Box.BtnCloseOpp,
                       $Box.CbToast, $Box.CbMortal, $Box.CbAnom,
                       $Box.TbBasisMyL, $Box.TbBasisOppL, $Box.TbBasisWarn, $Box.BtnRefresh,
-                      $Box.TbKeyScanL, $Box.TbKeyCloseL, $Box.TbKeyExitL, $Box.TbGoalL, $Box.TbBaseL, $Box.TbBaseHint, $Box.TbMinNL, $Box.TbMyScopeL, $Box.TbStatScopeL, $Box.TbScaleL, $Box.TbShowL, $Box.TbNickL, $Box.BtnNickApply,
+                      $Box.TbKeyScanL, $Box.TbKeyCloseL, $Box.TbKeyExitL, $Box.TbKeySetL, $Box.TbGoalL, $Box.TbBaseL, $Box.TbBaseHint, $Box.TbMinNL, $Box.TbMyScopeL, $Box.TbStatScopeL, $Box.TbScaleL, $Box.TbShowL, $Box.TbNickL, $Box.BtnNickApply,
                       $Box.TbSetupL, $Box.BtnSetupApply, $Box.TbAnomModeL, $Box.TbAnomHighL, $Box.TbAnomLowL, $Box.BtnAdv, $Box.CbBadge, $Box.BtnBadgeAdv, $Box.BtnStableAdv,
                       $Box.TbShowL, $Box.TbSrcL, $Box.LnkSource,
                       $Box.TbCrTitle, $Box.LnkRepo, $Box.TbCrSrc2, $Box.TbCrOcrL, $Box.LnkOcr, $Box.TbCrOcr2, $Box.TbCrLicL, $Box.TbCrLic1, $Box.TbCrLic2, $Box.TbCrLic3,
@@ -4461,10 +4527,10 @@ function Apply-BoxRatio {
             $el.Measure([Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
             if ([double]$el.DesiredSize.Width -gt $wMax) { $wMax = [double]$el.DesiredSize.Width }
         }
-        # 기본(100%)에 여유 5%를 굽는다 - 사용자가 105%를 '딱 적당'으로 고른 모습이 초기값
+        # 통계 개행 허용 폭에만 여유 5%를 굽는다 (통계가 필요할 때만 그만큼 쓰고, 안 쓰면 박스는 내용에 밀착)
         $target = $wMax * 1.05 * $rx
-        # 목표 폭이 자연 폭보다 크면 박스 최소 폭도 같이 늘려 통계가 짧아도 그 폭 유지
-        if ($Box.Panel) { $Box.Panel.MinWidth = $(if ($target -gt $wMax) { $target } else { 0 }) }
+        # 최소 폭 강제는 사용자가 비율을 100% 초과로 올렸을 때만 - 기본 상태에서 빈 오른쪽 공간이 생기지 않게
+        if ($Box.Panel) { $Box.Panel.MinWidth = $(if ($rx -gt 1.001) { $wMax * $rx } else { 0 }) }
         $Box.TbStat.MaxWidth = [math]::Max(160.0, $target)
         # 세로 = 줄 간격 (글자 높이보다 작아지지 않게 하한)
         foreach ($el in @($Box.TbName, $Box.TbRank, $Box.TbGoal, $Box.TbGame, $Box.TbStat)) {
@@ -5593,7 +5659,8 @@ function Set-StatWindow {
     $Box.TbName.Inlines.Add($nameRun)
     $sfxText = ''
     if ($Data.NameSuffix -and $script:Settings.Stable -and (Test-DispOn 'Stable' $isOppBox)) { $sfxText += [string]$Data.NameSuffix }
-    if ($Data.Badges -and $script:Settings.BadgeOn -and (Test-DispOn 'Badge' $isOppBox)) { $sfxText += '  ' + [string]$Data.Badges }
+    # 배지: 내 박스만 닉 줄에 - 상대 박스는 닉 줄이 길어져 기괴해서 전적 줄 뒤로 (아래 TbGame 렌더)
+    if ($Data.Badges -and $script:Settings.BadgeOn -and (Test-DispOn 'Badge' $isOppBox) -and -not $isOppBox) { $sfxText += '  ' + [string]$Data.Badges }
     $sfx2Text = ''
     if ($Data.NameSuffix2 -and $script:Settings.Stable -and (Test-DispOn 'Stable' $isOppBox)) { $sfx2Text = [string]$Data.NameSuffix2 }
     if ($sfxText) {
@@ -5693,6 +5760,13 @@ function Set-StatWindow {
         }
     } else {
         $Box.TbGame.Inlines.Add($Data.GameLine)
+        # 상대 박스 배지는 전적 줄 뒤 빈 공간에
+        if ($isOppBox -and $Data.Badges -and $script:Settings.BadgeOn -and (Test-DispOn 'Badge' $isOppBox)) {
+            $br9 = New-Object Windows.Documents.Run
+            $br9.Text = '  ' + [string]$Data.Badges
+            $br9.FontSize = [math]::Max(10, $Box.TbGame.FontSize - 1.5)
+            $Box.TbGame.Inlines.Add($br9)
+        }
     }
 
     # 통계 항목 렌더링 (특이 수치 심박 강조 포함)
@@ -6069,6 +6143,11 @@ $script:ReportXaml = @'
         <TextBlock x:Name="RcTabAll" Text="전체" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand" Margin="0,0,14,0"/>
         <TextBlock x:Name="RcTabRange" Text="기간" FontFamily="Malgun Gothic" FontSize="13.5" FontWeight="ExtraBold" Foreground="#FFF2F4F8" Cursor="Hand"/>
       </StackPanel>
+      <StackPanel x:Name="RcGranStrip" Orientation="Horizontal" Margin="0,6,0,0" Visibility="Collapsed">
+        <TextBlock x:Name="RcGranW" Text="주봉" Tag="week" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FFAAB4C4" Cursor="Hand" Margin="0,0,12,0" Opacity="0.45"/>
+        <TextBlock x:Name="RcGranM" Text="월봉" Tag="month" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FFAAB4C4" Cursor="Hand" Margin="0,0,12,0"/>
+        <TextBlock x:Name="RcGranY" Text="연봉" Tag="year" FontFamily="Malgun Gothic" FontSize="12" FontWeight="Bold" Foreground="#FFAAB4C4" Cursor="Hand" Opacity="0.45"/>
+      </StackPanel>
       <TextBlock x:Name="RcSeq" FontFamily="Malgun Gothic" FontSize="22" FontWeight="ExtraBold" Margin="0,12,0,0" Foreground="#FFF2F4F8"/>
       <TextBlock x:Name="RcStats" FontFamily="Malgun Gothic" FontSize="14" FontWeight="Bold" Foreground="#FFD9DCE1" Margin="0,8,0,0"/>
       <TextBlock x:Name="RcStats2" FontFamily="Malgun Gothic" FontSize="14" FontWeight="Bold" Foreground="#FFD9DCE1" Margin="0,2,0,0"/>
@@ -6141,12 +6220,24 @@ function Set-ReportTabs {
         if ($m -eq $Mode) { $tb.Opacity = 1.0; $tb.TextDecorations = [Windows.TextDecorations]::Underline }
         else { $tb.Opacity = 0.45; $tb.TextDecorations = $null }
     }
-    # 전체 탭은 이동할 이전/다음 기간이 없으므로 달력·화살표 숨김
+    # 전체 탭은 이동할 이전/다음 기간이 없으므로 달력·화살표 숨김, 대신 봉 단위 선택을 표시
     $navVis = 'Visible'
     if ($Mode -eq 'all') { $navVis = 'Collapsed' }
     foreach ($nm in @('RcCal', 'RcPrev', 'RcNext')) {
         $el = $Rw.FindName($nm)
         if ($el) { $el.Visibility = $navVis }
+    }
+    $gs = $Rw.FindName('RcGranStrip')
+    if ($gs) {
+        $gs.Visibility = $(if ($Mode -eq 'all') { 'Visible' } else { 'Collapsed' })
+        $curG = [string]$script:ReportAllGran
+        if (-not $curG) { $curG = 'month' }
+        foreach ($gn in @('RcGranW', 'RcGranM', 'RcGranY')) {
+            $ge = $Rw.FindName($gn)
+            if (-not $ge) { continue }
+            if ([string]$ge.Tag -eq $curG) { $ge.Opacity = 1.0; $ge.TextDecorations = [Windows.TextDecorations]::Underline }
+            else { $ge.Opacity = 0.45; $ge.TextDecorations = $null }
+        }
     }
     if ($Mode -eq 'all') {
         $pop = $Rw.FindName('RcCalPop')
@@ -6548,6 +6639,11 @@ function Fill-ReportContent {
                 }
                 $showLbl = $true
                 if ($mode -eq 'month') { $dnum = $i + 1; $showLbl = ($dnum -eq 1 -or $dnum % 5 -eq 0) }
+                elseif ($bks.Count -gt 16) {
+                    # 버킷이 많으면(전체 월봉/주봉 등) 라벨을 성기게 - 겹침 방지
+                    $step9 = [int][math]::Ceiling($bks.Count / 8.0)
+                    $showLbl = (($i % $step9) -eq 0)
+                }
                 if ($showLbl) {
                     $lb = New-Object Windows.Controls.TextBlock
                     $lb.Text = [string]$bks[$i].Label
@@ -6735,20 +6831,33 @@ function Fill-ReportContent {
         } else {
             $lastRateP = 0.0
             if ($n -gt 0) { $lastRateP = $rc[3] / $n }
-            # 기간 내 최저 누적 수지 (낙폭 후 반등 감지용)
-            $minCum = 0; $cumV = 0
-            foreach ($b in $bks) { $cumV += [int]$b.Diff; if ($cumV -lt $minCum) { $minCum = $cumV } }
-            if ($n -eq 0) { $comment = '이 기간엔 대국 기록이 없어요' }
-            elseif ($minCum -le -300 -and $diff -gt 0) { $comment = '🎢 바닥 찍고 반등한 구간!' }
-            elseif ($diff -ge 500) { $comment = '📈 폭풍 성장 구간!' }
-            elseif ($rate -ge 0.55 -and $diff -gt 0) { $comment = '🔥 흐름이 좋아요' }
-            elseif ($diff -ge 150) { $comment = '📈 순항 중입니다' }
-            elseif ($diff -gt 0) { $comment = '👍 플러스로 마감한 구간' }
-            elseif ($diff -le -500) { $comment = '💀 시련의 구간이었네요...' }
-            elseif ($lastRateP -ge 0.4) { $comment = '⚰️ 라스가 유난히 잦았던 구간이네요' }
-            elseif ($diff -le -150) { $comment = '🩸 손실이 좀 컸던 구간' }
-            elseif ($diff -lt 0) { $comment = '📉 다음 구간을 노려봅시다' }
-            else { $comment = '꾸준히 진행 중' }
+            # 전체 탭은 한줄평 생략 (계정 인생 전체에 '구간' 코멘트는 어색함)
+            if ($mode -eq 'all') {
+                $comment = ''
+            } else {
+                # 기간 단위별 명칭·문턱값 (주/월/시즌/연/기간 각각 어감과 규모에 맞게)
+                $nm = '구간'; $nextNm = '다음 구간을'; $big = 500; $mid = 150; $dip = -300
+                switch ($mode) {
+                    'week' { $nm = '한 주'; $nextNm = '다음 주를'; $big = 300; $mid = 100; $dip = -200 }
+                    'month' { $nm = '한 달'; $nextNm = '다음 달을'; $big = 500; $mid = 150; $dip = -300 }
+                    'season' { $nm = '시즌'; $nextNm = '다음 시즌을'; $big = 500; $mid = 150; $dip = -300 }
+                    'year' { $nm = '한 해'; $nextNm = '내년을'; $big = 1500; $mid = 400; $dip = -800 }
+                }
+                # 기간 내 최저 누적 수지 (낙폭 후 반등 감지용)
+                $minCum = 0; $cumV = 0
+                foreach ($b in $bks) { $cumV += [int]$b.Diff; if ($cumV -lt $minCum) { $minCum = $cumV } }
+                if ($n -eq 0) { $comment = ('이 {0}엔 대국 기록이 없어요' -f $(if ($mode -eq 'range') { '기간' } else { $nm })) }
+                elseif ($minCum -le $dip -and $diff -gt 0) { $comment = ('🎢 바닥 찍고 반등한 {0}!' -f $nm) }
+                elseif ($diff -ge $big) { $comment = ('📈 폭풍 성장의 {0}!' -f $nm) }
+                elseif ($rate -ge 0.55 -and $diff -gt 0) { $comment = '🔥 흐름이 좋아요' }
+                elseif ($diff -ge $mid) { $comment = ('📈 착실히 쌓아올린 {0}' -f $nm) }
+                elseif ($diff -gt 0) { $comment = ('👍 플러스로 마감한 {0}' -f $nm) }
+                elseif ($diff -le (-$big)) { $comment = ('💀 시련의 {0}...' -f $nm) }
+                elseif ($lastRateP -ge 0.4) { $comment = ('⚰️ 라스가 유난히 잦았던 {0}' -f $nm) }
+                elseif ($diff -le (-$mid)) { $comment = ('🩸 손실이 좀 컸던 {0}' -f $nm) }
+                elseif ($diff -lt 0) { $comment = ('📉 {0} 노려봅시다' -f $nextNm) }
+                else { $comment = ('무난하게 지나간 {0}' -f $nm) }
+            }
         }
         $rcC.Text = $comment
     } catch {}
@@ -6764,11 +6873,14 @@ function Request-Report {
         if ($RangeEnd -lt $Anchor) { $t0 = $Anchor; $Anchor = $RangeEnd; $RangeEnd = $t0 }
         $script:ReportRangeEnd = $RangeEnd
     }
-    $rw.Tag = @{ Mode = $Mode; Anchor = $Anchor; RangeEnd = $RangeEnd }
+    $gran9 = [string]$script:ReportAllGran
+    if (-not $gran9) { $gran9 = 'month' }
+    $rw.Tag = @{ Mode = $Mode; Anchor = $Anchor; RangeEnd = $RangeEnd; Gran = $gran9 }
     $script:ReportAnchors[$Mode] = $Anchor
     Set-ReportTabs $rw $Mode
     $key = ('{0}|{1}' -f $Mode, $Anchor.ToString('yyyy-MM-dd'))
     if ($Mode -eq 'range') { $key += ('|{0}' -f $RangeEnd.ToString('yyyy-MM-dd')) }
+    elseif ($Mode -eq 'all') { $key += ('|{0}' -f $gran9) }   # 전체 탭은 봉 단위별 캐시
 
     # 오늘-일간은 라이브 데이터로 즉시 표시 (초기 로딩 전엔 라이브 데이터가 없으니 백그라운드 조회로)
     if ($Mode -eq 'day' -and $Anchor -eq [DateTime]::Today -and $script:LastData) {
@@ -6801,6 +6913,7 @@ function Request-Report {
     $script:ReportStart = Get-Date
     $repArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-ReportOnce', $Mode, $Anchor.ToString('yyyy-MM-dd'))
     if ($Mode -eq 'range') { $repArgs += $RangeEnd.ToString('yyyy-MM-dd') }
+    elseif ($Mode -eq 'all') { $repArgs += $gran9 }
     $script:ReportProc = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList $repArgs
     $script:ReportPollTimer.Start()
 }
@@ -6846,6 +6959,17 @@ function Show-ReportCard {
         }
         foreach ($tn in @('RcTabDay', 'RcTabWeek', 'RcTabMonth', 'RcTabSeason', 'RcTabYear', 'RcTabAll')) {
             $rw.FindName($tn).Add_MouseLeftButtonDown($tabHandler)
+        }
+        # 전체 탭 봉 단위 선택 (주봉/월봉/연봉) - Tag는 XAML에 정의됨
+        $granHandler = {
+            $args[1].Handled = $true
+            $g = [string]$args[0].Tag
+            if ($g -eq [string]$script:ReportAllGran) { return }
+            $script:ReportAllGran = $g
+            Request-Report 'all' (Get-PeriodAnchor 'all' ([DateTime]::Today))
+        }
+        foreach ($gn in @('RcGranW', 'RcGranM', 'RcGranY')) {
+            $rw.FindName($gn).Add_MouseLeftButtonDown($granHandler)
         }
         # '기간' 탭: 이전 범위가 있으면 바로 표시하고, 없으면 달력에서 범위 선택
         $rw.FindName('RcTabRange').Add_MouseLeftButtonDown({
@@ -7001,6 +7125,7 @@ $script:ReportProc = $null
 $script:ReportStart = $null
 $script:ReportReqKey = ''
 $script:ReportCache = @{}
+$script:ReportAllGran = 'month'   # 전체 탭 봉 단위 (week/month/year)
 $script:ReportAnchors = @{}
 $script:ReportWin = $null
 $script:CalSyncing = $false
@@ -7025,6 +7150,9 @@ $reportPollTimer.Add_Tick({
             try {
                 $cur = $script:ReportWin.Tag
                 $curKey = ('{0}|{1}' -f [string]$cur.Mode, ([DateTime]$cur.Anchor).ToString('yyyy-MM-dd'))
+                # 요청 키와 같은 규칙으로 재구성 (range에 끝날짜가 빠져 첫 조회 결과가 안 뜨던 버그 수정)
+                if ([string]$cur.Mode -eq 'range') { $curKey += ('|{0}' -f ([DateTime]$cur.RangeEnd).ToString('yyyy-MM-dd')) }
+                elseif ([string]$cur.Mode -eq 'all') { $curKey += ('|{0}' -f [string]$cur.Gran) }
                 if ($curKey -eq $script:ReportReqKey) { Fill-ReportContent $script:ReportWin $pack }
             } catch {}
         }
@@ -7207,7 +7335,7 @@ if (Test-Path $posFile) {
             if ($null -ne $pos.Settings.StatBasis -and [int]$pos.Settings.StatBasis -gt 0) {
                 $script:Settings.MyBasis = 'g' + [int]$pos.Settings.StatBasis
             }
-            foreach ($kk in @('KeyScan', 'KeyClose', 'KeyExit')) {
+            foreach ($kk in @('KeyScan', 'KeyClose', 'KeyExit', 'KeySet')) {
                 if ($pos.Settings.$kk -and $script:KeyOptions -contains $pos.Settings.$kk) { $script:Settings[$kk] = [string]$pos.Settings.$kk }
             }
             if ($null -ne $pos.Settings.DailyGoal) { $script:Settings.DailyGoal = [int]$pos.Settings.DailyGoal }
@@ -7268,7 +7396,7 @@ try {
     $my.SettingsPanel.Visibility = 'Visible'
     # 탭 분할: SettingsPanel 자식들을 탭별 패널로 재분배 (탭 추가 = SetTabDefs 배열 + 매핑에 항목 추가가 전부)
     $script:SetTabDefs = @('설정', '닉네임/키/프리셋', '크레딧')
-    $tabMap = @{ TbNickL = 1; TbKeyScanL = 1; TbKeyCloseL = 1; TbKeyExitL = 1; TbPresetL = 1; TxPreset = 1; CmbPreset = 1; TbSizeTgtL = 0; TbScaleL = 0
+    $tabMap = @{ TbNickL = 1; TbKeyScanL = 1; TbKeyCloseL = 1; TbKeyExitL = 1; TbKeySetL = 1; TbPresetL = 1; TxPreset = 1; CmbPreset = 1; TbSizeTgtL = 0; TbScaleL = 0
                  TbCrTitle = 2; LnkRepo = 2; TbSrcL = 2; LnkSource = 2; TbCrSrc2 = 2; TbCrOcrL = 2; LnkOcr = 2; TbCrOcr2 = 2; TbCrLicL = 2; TbCrLic1 = 2; TbCrLic2 = 2; TbCrLic3 = 2 }
     $script:SetTabPanels = @()
     $script:SetTabBtns = @()
@@ -7554,7 +7682,9 @@ function Request-StableFill {
     if ($need.Count -eq 0) { return }
     foreach ($k in $need) { $script:StableReq[$k] = Get-Date }
     $sm = $(if ($sawMy) { '1' } else { '0' })
-    $null = Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-StableOnce', "$room", $sm, ($need -join '.')
+    $p9 = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-StableOnce', "$room", $sm, ($need -join '.')
+    # 워커 핸들 보관: 살아있는 동안엔 폴 타이머가 대기를 포기하지 않게 (긴 대기열에서 뒷순번이 240초를 넘던 문제)
+    $script:StableProcs = @(@($script:StableProcs | Where-Object { $_ -and -not $_.HasExited }) + $p9)
     $script:StablePollTimer.Start()
 }
 
@@ -7724,6 +7854,7 @@ $script:ScanPollTimer = $scanPollTimer
 
 # 안정단 워커(-StableOnce) 결과 수거: stable-<id>.json이 생기는 즉시 해당 박스만 갱신
 $script:StableReq = @{}
+$script:StableProcs = @()
 try { Remove-Item (Join-Path $script:DataDir 'stable-*.json') -Force -ErrorAction SilentlyContinue } catch {}
 $stablePollTimer = New-Object Windows.Threading.DispatcherTimer
 $stablePollTimer.Interval = [TimeSpan]::FromMilliseconds(600)
@@ -7741,8 +7872,13 @@ $stablePollTimer.Add_Tick({
             } catch {}
             try { Remove-Item $f -Force -ErrorAction SilentlyContinue } catch {}
             $done += $k
-        } elseif (((Get-Date) - $script:StableReq[$k]).TotalSeconds -gt 240) {
-            $done += $k   # 워커 실패/실종 - 포기 (다음 스캔에서 재시도)
+        } else {
+            $el9 = ((Get-Date) - $script:StableReq[$k]).TotalSeconds
+            $alive9 = (@($script:StableProcs | Where-Object { $_ -and -not $_.HasExited }).Count -gt 0)
+            # 워커가 아직 살아 있으면 순번 대기 중일 수 있으니 계속 기다림 (상한 900초)
+            if (($el9 -gt 240 -and -not $alive9) -or $el9 -gt 900) {
+                $done += $k   # 워커 실패/실종 - 포기 (다음 스캔에서 재시도)
+            }
         }
     }
     foreach ($k in $done) { $script:StableReq.Remove($k) }
@@ -7790,7 +7926,7 @@ $hotkeyTimer.Add_Tick({
     $z = ($ctrl -and $zero)
     if ($z -and -not $script:KeyDown['ctrl0']) { Set-UiScale 1.0 }
     $script:KeyDown['ctrl0'] = $z
-    foreach ($def in @(@('KeyScan', 'scan'), @('KeyClose', 'close'), @('KeyExit', 'exit'))) {
+    foreach ($def in @(@('KeyScan', 'scan'), @('KeyClose', 'close'), @('KeyExit', 'exit'), @('KeySet', 'set'))) {
         $vk = $script:VKMap[[string]$script:Settings[$def[0]]]
         if (-not $vk) { $script:KeyDown[$def[1]] = $false; continue }
         $dn = ([Native]::GetAsyncKeyState($vk) -band 0x8000) -ne 0
@@ -7801,6 +7937,7 @@ $hotkeyTimer.Add_Tick({
                 'scan' { Update-Opponents }
                 'close' { Close-Opponents }
                 'exit' { $win.Close(); return }
+                'set' { Toggle-SettingsWin $script:MyBox }
             }
         }
     }

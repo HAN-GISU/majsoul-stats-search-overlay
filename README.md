@@ -1,6 +1,6 @@
 ﻿# 작혼 전적 검색 오버레이 (Majsoul Stats Search Overlay)
 
-**v1.1.1** · © 2026 [HAN-GISU](https://github.com/HAN-GISU) · MIT License
+**v1.1.2** · © 2026 [HAN-GISU](https://github.com/HAN-GISU) · MIT License
 
 작혼(Mahjong Soul) 게임 화면 위에 나와 상대의 전적을 실시간으로 띄워주는 Windows 오버레이입니다.
 게임 파일이나 통신에 일절 개입하지 않고 화면 위에 창을 얹는 방식입니다.
@@ -51,6 +51,8 @@
 ```
 powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경로\majsoul-overlay\tools\steam-launch.ps1" %command%
 ```
+
+> ⚠ **주의: 이 방식을 쓰면 스팀 인앱 결제가 안 됩니다.** %command%를 래퍼로 감싸면 스팀 오버레이 훅 연결이 끊겨 게임 내 상점의 결제창이 뜨지 않습니다. 결제할 때는 시작 옵션을 잠시 비우고 게임을 재실행한 뒤 결제하고, 끝나면 다시 넣으세요.
 
 ## 사용법
 
