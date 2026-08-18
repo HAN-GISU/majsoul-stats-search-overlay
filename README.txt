@@ -93,15 +93,16 @@
 스팀 라이브러리 → 작혼 우클릭 → 속성 → 시작 옵션에 아래 한 줄
 (경로는 본인이 압축 푼 폴더로 수정):
 
-powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경로\majsoul-overlay\tools\steam-launch.ps1" %command%
+"C:\경로\majsoul-overlay\tools\steam-wrapper.exe" %command%
 
 → 게임 켜면 오버레이 자동 시작, 게임 끄면 자동 종료
+→ steam-wrapper.exe가 없으면 오버레이를 한 번 실행하면
+   자동 생성됩니다
 
-⚠ 주의: 이 방식을 쓰면 스팀 인앱 결제가 안 됩니다.
-   시작 옵션 래퍼가 스팀 오버레이 훅 연결을 끊어 게임 내
-   상점의 결제창이 뜨지 않습니다. 결제할 때는 시작 옵션을
-   잠시 비우고 게임을 재실행한 뒤 결제하고, 끝나면 다시
-   넣으세요.
+※ 예전 안내(v1.1.1 이하)의 steam-launch.ps1(PowerShell)
+   방식은 스팀 오버레이 훅을 끊어 인앱 결제창이 뜨지 않는
+   문제가 있어 exe 래퍼로 교체됐습니다. 기존 사용자는
+   시작 옵션을 위 한 줄로 바꿔 주세요.
 
 
 이 프로젝트의 코드는 AI 도구(Anthropic Claude)를 활용해

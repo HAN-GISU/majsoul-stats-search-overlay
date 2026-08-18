@@ -44,15 +44,17 @@
 
 엔진이 없으면 Windows 내장 문자인식으로 동작합니다. 이 경우 외국어 닉네임 인식을 위해 `tools` 폴더의 `install-ocr.bat`을 더블클릭하고 UAC에서 "예"를 누르세요. ⚠ 설치 창 안을 클릭하지 마세요 (일시정지됨 — 멈춘 것 같으면 Esc). Windows 공식 언어 구성요소만 설치되며 시스템 언어/키보드 설정은 바뀌지 않습니다.
 
-### 스팀 연동 (선택)
+### 스팀 연동 (선택) — 게임과 같이 켜고 끄기
 
 스팀 라이브러리에서 작혼 우클릭 → 속성 → **시작 옵션**에 아래 한 줄 (경로는 본인 폴더로 수정):
 
 ```
-powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경로\majsoul-overlay\tools\steam-launch.ps1" %command%
+"C:\경로\majsoul-overlay\tools\steam-wrapper.exe" %command%
 ```
 
-> ⚠ **주의: 이 방식을 쓰면 스팀 인앱 결제가 안 됩니다.** %command%를 래퍼로 감싸면 스팀 오버레이 훅 연결이 끊겨 게임 내 상점의 결제창이 뜨지 않습니다. 결제할 때는 시작 옵션을 잠시 비우고 게임을 재실행한 뒤 결제하고, 끝나면 다시 넣으세요.
+게임을 켜면 오버레이가 자동 시작되고, 게임을 끄면 자동 종료됩니다. `steam-wrapper.exe`가 없으면 오버레이를 한 번 실행하면 자동 생성됩니다.
+
+> ※ 예전 안내(v1.1.1 이하)의 `steam-launch.ps1`(PowerShell) 방식은 스팀 오버레이 훅을 끊어 **인앱 결제창이 뜨지 않는 문제**가 있어 exe 래퍼로 교체됐습니다. 기존 사용자는 시작 옵션을 위 한 줄로 바꿔 주세요.
 
 ## 사용법
 

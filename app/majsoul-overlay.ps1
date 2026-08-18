@@ -3184,6 +3184,62 @@ class Launcher {
             Remove-Item $tmpCs -Force -ErrorAction SilentlyContinue
         }
     }
+    # 스팀 시작 옵션용 exe 래퍼 자동 빌드 (없을 때만): "...\tools\steam-wrapper.exe" %command%
+    # PowerShell 래퍼는 스팀 오버레이 훅을 끊어 인앱 결제가 막혔음 - exe 래퍼(SMAPI 패턴)는 훅 전파가 유지됨
+    $wrapPath = Join-Path $script:BaseDir 'tools\steam-wrapper.exe'
+    if (-not (Test-Path $wrapPath)) {
+        $csc2 = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) 'csc.exe'
+        if ((Test-Path $csc2) -and (Test-Path $icoPath)) {
+            $wsrc = @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+class SteamWrapper {
+    static int Main(string[] args) {
+        // tools\ 에서 실행됨 - 오버레이 본체는 ..\app\
+        string root = AppDomain.CurrentDomain.BaseDirectory;
+        string ps1 = Path.GetFullPath(Path.Combine(root, "..", "app", "majsoul-overlay.ps1"));
+        string gameProc = "";
+        if (args.Length > 0) { try { gameProc = Path.GetFileNameWithoutExtension(args[0]); } catch {} }
+        try {
+            var psi = new ProcessStartInfo();
+            psi.FileName = "powershell.exe";
+            var sb = new StringBuilder();
+            sb.Append("-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File \"").Append(ps1).Append("\"");
+            if (gameProc.Length > 0) { sb.Append(" -GameProc \"").Append(gameProc).Append("\""); }
+            psi.Arguments = sb.ToString();
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            Process.Start(psi);
+        } catch {}
+        if (args.Length == 0) { return 0; }
+        // 게임을 직접 자식으로 실행하고 종료까지 대기 (SMAPI 패턴 - 스팀 오버레이 훅 전파 유지)
+        var g = new ProcessStartInfo();
+        g.FileName = args[0];
+        var ga = new StringBuilder();
+        for (int i = 1; i < args.Length; i++) {
+            if (ga.Length > 0) { ga.Append(' '); }
+            ga.Append('"').Append(args[i].Replace("\"", "\\\"")).Append('"');
+        }
+        g.Arguments = ga.ToString();
+        try { g.WorkingDirectory = Path.GetDirectoryName(args[0]); } catch {}
+        g.UseShellExecute = false;
+        try {
+            var p = Process.Start(g);
+            p.WaitForExit();
+            return p.ExitCode;
+        } catch { return 1; }
+    }
+}
+'@
+            $tmpCs2 = Join-Path $env:TEMP 'mjs-steamwrap.cs'
+            [IO.File]::WriteAllText($tmpCs2, $wsrc)
+            $null = & $csc2 /nologo /target:winexe "/win32icon:$icoPath" "/out:$wrapPath" $tmpCs2 2>&1
+            Remove-Item $tmpCs2 -Force -ErrorAction SilentlyContinue
+        }
+    }
 } catch {}
 
 # 갱신 중 UI 멈춤 방지: 비동기 HTTP + 메시지 펌프 활성화 (GUI 프로세스 전용)
