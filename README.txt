@@ -93,7 +93,7 @@
 스팀 라이브러리 → 작혼 우클릭 → 속성 → 시작 옵션에 아래 한 줄
 (경로는 본인이 압축 푼 폴더로 수정):
 
-"C:\경로\majsoul-overlay\tools\steam-wrapper.exe" %command%
+"압축해제경로\majsoul-overlay\tools\steam-wrapper.exe" %command%
 
 → 게임 켜면 오버레이 자동 시작, 게임 끄면 자동 종료
 → steam-wrapper.exe가 없으면 오버레이를 한 번 실행하면
