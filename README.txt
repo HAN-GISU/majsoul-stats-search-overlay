@@ -1,5 +1,5 @@
 ﻿════════════════════════════════════════════════════
- 작혼 전적 검색 오버레이 v1.1.1  © 2026 HAN-GISU
+ 작혼 전적 검색 오버레이 v1.2.0  © 2026 HAN-GISU
 ════════════════════════════════════════════════════
 
 게임 화면 위에 나와 상대의 전적을 띄워주는 오버레이입니다.
@@ -93,9 +93,11 @@
 스팀 라이브러리 → 작혼 우클릭 → 속성 → 시작 옵션에 아래 한 줄
 (경로는 본인이 압축 푼 폴더로 수정):
 
-powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\경로\majsoul-overlay\tools\steam-launch.ps1" %command%
+"압축해제경로\majsoul-overlay\tools\steam-wrapper.exe" %command%
 
 → 게임 켜면 오버레이 자동 시작, 게임 끄면 자동 종료
+→ steam-wrapper.exe가 없으면 오버레이를 한 번 실행하면
+   자동 생성됩니다
 
 
 이 프로젝트의 코드는 AI 도구(Anthropic Claude)를 활용해
