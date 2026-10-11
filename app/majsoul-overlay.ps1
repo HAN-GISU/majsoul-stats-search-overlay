@@ -3157,89 +3157,109 @@ if (-not $script:InstanceMutex.WaitOne(0)) { exit }
 # 앱 아이콘은 스크립트에 내장 (base64) - 루트에 낱개 파일을 두지 않고 필요할 때 data\에 복원
 $script:IconB64 = 'AAABAAEAQEAQAAAAAABoCgAAFgAAACgAAABAAAAAgAAAAAEABAAAAAAAAAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACAAAAAgIAAgAAAAIAAgACAgAAAgICAAMDAwAAAAP8AAP8AAAD//wD/AAAA/wD/AP//AAD///8AAAAAAEZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmAAAAAAAARmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAAZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmdmZmAAAAZmeP////////////////////////////////h2ZgAARmf///////////////////////////////////dmQABmf////////////////////////////////////3ZgAGZ/////////////////////////////////////hmAEZo/////////////////////////////////////2ZARm//////////////////////////////////////dmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv//////////mZmZmZmZmZmZmZmV///////////2ZgZm//////////+ZmZmZmZmZmZmZmZX///////////ZmBmb//////////5mZmZmZmZmZmZmZlf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmP///4mY////+ZX///////////ZmBmb//////////5mY////iZj////5lf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmP///4mY////+ZX///////////ZmBmb//////////5mY////iZj////5lf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmZmZmZmZmZmZmZX///////////ZmBmb//////////5mZmZmZmZmZmZmZlf//////////9mYGZv//////////mZmZmZmZmZmZmZmV///////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBGaP////////////////////////////////////9mYAZo////////////////////////////////////+GZABmf////////////////////////////////////4ZgAGZo///////////////////////////////////4dmAABmeP/////////////////////////////////4dmQAAEZmeI//////////////////////////////iHdmYAAABGZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAABmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmAAAAAAAAAEZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/gAAAAAAAf/wAAAAAAAAf8AAAAAAAAAfgAAAAAAAAA+AAAAAAAAADwAAAAAAAAAHAAAAAAAAAAcAAAAAAAAABwAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAADAAAAAAAAAAMAAAAAAAAABwAAAAAAAAAHAAAAAAAAAAeAAAAAAAAAD8AAAAAAAAAP4AAAAAAAAD/wAAAAAAAAf/8AAAAAAAf///////////w=='
 
-# 실행용 EXE 자동 빌드 - 아이콘 박힌 진입점 (없을 때만, 윈도우 내장 csc 사용이라 별도 설치 불필요)
+# 실행용 EXE 자동 빌드 - 아이콘 박힌 진입점 + 스팀 래퍼 (윈도우 내장 csc 사용이라 별도 설치 불필요)
+# 없거나 버전이 이 스크립트와 다르면 (재)빌드 - 업데이트 후 첫 실행에 구버전 exe도 자동 교체
+# 백신 오탐 방지: PowerShell을 띄우는 exe는 진입점 하나뿐, 스팀 래퍼는 진입점 exe만 실행
+#   (v1.2.0 래퍼가 숨김 PowerShell을 직접 띄우다 Defender에 Trojan:Win32/Bearfoos.B!ml로 오탐 격리됨)
 try {
     $exePath = Join-Path $script:BaseDir '작혼 오버레이.exe'
     $icoPath = Join-Path $script:DataDir 'overlay.ico'
     if (-not (Test-Path $icoPath)) { [IO.File]::WriteAllBytes($icoPath, [Convert]::FromBase64String($script:IconB64)) }
-    if (-not (Test-Path $exePath)) {
+    $shimVer = if ($script:AppVer) { $script:AppVer.TrimStart('v') + '.0' } else { '' }
+    function Build-ShimExe([string]$OutPath, [string]$Tag, [string]$Title, [string]$Source) {
+        $old = "$OutPath.old"
+        # 지난 교체 때 실행 중이라 못 지운 구버전 정리 (본체가 없으면 되살림)
+        if (Test-Path $old) {
+            if (Test-Path $OutPath) { Remove-Item $old -Force -ErrorAction SilentlyContinue }
+            else { Move-Item $old $OutPath -Force -ErrorAction SilentlyContinue }
+        }
+        if ((Test-Path $OutPath) -and (-not $shimVer -or [Diagnostics.FileVersionInfo]::GetVersionInfo($OutPath).FileVersion -eq $shimVer)) { return }
         $csc = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) 'csc.exe'
-        if ((Test-Path $csc) -and (Test-Path $icoPath)) {
-            $lsrc = @'
+        if (-not ((Test-Path $csc) -and (Test-Path $icoPath))) { return }
+        # 실행 중인 exe(게임 중인 스팀 래퍼)는 덮어쓸 수 없지만 이름 바꾸기는 됨 - 옆으로 비켜두고 새로 빌드
+        if (Test-Path $OutPath) { try { Move-Item $OutPath $old -Force -ErrorAction Stop } catch { return } }
+        $ver = if ($shimVer) { $shimVer } else { '0.0.0.0' }
+        # 버전 정보 리소스 (파일 속성 → 자세히): 출처 표기 없는 exe로 보이지 않게
+        $src = @"
+[assembly: System.Reflection.AssemblyTitle("$Title")]
+[assembly: System.Reflection.AssemblyProduct("Majsoul Stats Search Overlay")]
+[assembly: System.Reflection.AssemblyCompany("HAN-GISU")]
+[assembly: System.Reflection.AssemblyCopyright("(c) 2026 HAN-GISU, MIT License")]
+[assembly: System.Reflection.AssemblyVersion("$ver")]
+[assembly: System.Reflection.AssemblyFileVersion("$ver")]
+
+"@ + $Source
+        $tmpCs = Join-Path $env:TEMP "mjs-$Tag.cs"
+        try {
+            # BOM 필수 - 없으면 구형 csc가 시스템 코드페이지로 읽어 한글 문자열(파일명 등)이 깨짐
+            [IO.File]::WriteAllText($tmpCs, $src, (New-Object Text.UTF8Encoding($true)))
+            $null = & $csc /nologo /target:winexe "/win32icon:$icoPath" "/out:$OutPath" $tmpCs 2>&1
+        } catch {}
+        Remove-Item $tmpCs -Force -ErrorAction SilentlyContinue
+        # 빌드 실패 시 구버전 복구 - 래퍼가 사라지면 스팀이 "실행 파일 누락"으로 게임을 못 켬
+        if (Test-Path $old) {
+            if (Test-Path $OutPath) { Remove-Item $old -Force -ErrorAction SilentlyContinue }
+            else { Move-Item $old $OutPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    # 진입점: 오버레이 본체(app\majsoul-overlay.ps1)를 콘솔 창 없이 실행
+    Build-ShimExe $exePath 'launcher' '작혼 오버레이' @'
 class Launcher {
-    static void Main() {
+    static void Main(string[] args) {
         var psi = new System.Diagnostics.ProcessStartInfo();
         psi.FileName = "powershell.exe";
-        psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +
+        psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" +
             System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory, "app", "majsoul-overlay.ps1") + "\"";
+        // 스팀 래퍼가 넘기는 -GameProc <게임 프로세스 이름> 전달 - 게임 종료 시 오버레이도 종료
+        if (args.Length >= 2 && args[0] == "-GameProc" && args[1].Length > 0 && args[1].IndexOfAny(new[] { '"', '\\' }) < 0) {
+            psi.Arguments += " -GameProc \"" + args[1] + "\"";
+        }
         psi.UseShellExecute = false;
-        psi.CreateNoWindow = true;
+        psi.CreateNoWindow = true;   // 콘솔 창 자체를 만들지 않음 (-WindowStyle Hidden 불필요)
         System.Diagnostics.Process.Start(psi);
     }
 }
 '@
-            $tmpCs = Join-Path $env:TEMP 'mjs-launcher.cs'
-            [IO.File]::WriteAllText($tmpCs, $lsrc)
-            $null = & $csc /nologo /target:winexe "/win32icon:$icoPath" "/out:$exePath" $tmpCs 2>&1
-            Remove-Item $tmpCs -Force -ErrorAction SilentlyContinue
-        }
-    }
-    # 스팀 시작 옵션용 exe 래퍼 자동 빌드 (없을 때만): "...\tools\steam-wrapper.exe" %command%
-    # PowerShell 래퍼는 스팀 오버레이 훅을 끊어 인앱 결제가 막혔음 - exe 래퍼(SMAPI 패턴)는 훅 전파가 유지됨
-    $wrapPath = Join-Path $script:BaseDir 'tools\steam-wrapper.exe'
-    if (-not (Test-Path $wrapPath)) {
-        $csc2 = Join-Path ([Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) 'csc.exe'
-        if ((Test-Path $csc2) -and (Test-Path $icoPath)) {
-            $wsrc = @'
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Text;
 
+    # 스팀 시작 옵션용 래퍼: "...\tools\steam-wrapper.exe" %command%
+    # PowerShell 래퍼는 스팀 오버레이 훅을 끊어 인앱 결제가 막혔음 - exe 래퍼(SMAPI 패턴)는 훅 전파가 유지됨
+    Build-ShimExe (Join-Path $script:BaseDir 'tools\steam-wrapper.exe') 'steamwrap' '작혼 오버레이 스팀 래퍼' @'
 class SteamWrapper {
     static int Main(string[] args) {
-        // tools\ 에서 실행됨 - 오버레이 본체는 ..\app\
-        string root = AppDomain.CurrentDomain.BaseDirectory;
-        string ps1 = Path.GetFullPath(Path.Combine(root, "..", "app", "majsoul-overlay.ps1"));
+        // tools\ 에서 실행됨 - 오버레이는 상위 폴더의 진입점 exe로 띄움 (PowerShell 직접 실행 X)
+        string root = System.AppDomain.CurrentDomain.BaseDirectory;
+        string launcher = System.IO.Path.GetFullPath(System.IO.Path.Combine(root, "..", "작혼 오버레이.exe"));
         string gameProc = "";
-        if (args.Length > 0) { try { gameProc = Path.GetFileNameWithoutExtension(args[0]); } catch {} }
+        if (args.Length > 0) { try { gameProc = System.IO.Path.GetFileNameWithoutExtension(args[0]); } catch {} }
         try {
-            var psi = new ProcessStartInfo();
-            psi.FileName = "powershell.exe";
-            var sb = new StringBuilder();
-            sb.Append("-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File \"").Append(ps1).Append("\"");
-            if (gameProc.Length > 0) { sb.Append(" -GameProc \"").Append(gameProc).Append("\""); }
-            psi.Arguments = sb.ToString();
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = launcher;
+            if (gameProc.Length > 0) { psi.Arguments = "-GameProc \"" + gameProc + "\""; }
+            psi.WorkingDirectory = System.IO.Path.GetDirectoryName(launcher);
             psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-            Process.Start(psi);
+            System.Diagnostics.Process.Start(psi);
         } catch {}
         if (args.Length == 0) { return 0; }
         // 게임을 직접 자식으로 실행하고 종료까지 대기 (SMAPI 패턴 - 스팀 오버레이 훅 전파 유지)
-        var g = new ProcessStartInfo();
+        var g = new System.Diagnostics.ProcessStartInfo();
         g.FileName = args[0];
-        var ga = new StringBuilder();
+        var ga = new System.Text.StringBuilder();
         for (int i = 1; i < args.Length; i++) {
             if (ga.Length > 0) { ga.Append(' '); }
             ga.Append('"').Append(args[i].Replace("\"", "\\\"")).Append('"');
         }
         g.Arguments = ga.ToString();
-        try { g.WorkingDirectory = Path.GetDirectoryName(args[0]); } catch {}
+        try { g.WorkingDirectory = System.IO.Path.GetDirectoryName(args[0]); } catch {}
         g.UseShellExecute = false;
         try {
-            var p = Process.Start(g);
+            var p = System.Diagnostics.Process.Start(g);
             p.WaitForExit();
             return p.ExitCode;
         } catch { return 1; }
     }
 }
 '@
-            $tmpCs2 = Join-Path $env:TEMP 'mjs-steamwrap.cs'
-            [IO.File]::WriteAllText($tmpCs2, $wsrc)
-            $null = & $csc2 /nologo /target:winexe "/win32icon:$icoPath" "/out:$wrapPath" $tmpCs2 2>&1
-            Remove-Item $tmpCs2 -Force -ErrorAction SilentlyContinue
-        }
-    }
 } catch {}
 
 # 갱신 중 UI 멈춤 방지: 비동기 HTTP + 메시지 펌프 활성화 (GUI 프로세스 전용)

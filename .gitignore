@@ -2,6 +2,7 @@
 data/
 *.lnk
 *.exe
+*.exe.old
 overlay-pos.json
 scan-log*.txt
 scan-result.json
