@@ -3150,12 +3150,112 @@ if ($args.Count -ge 2 -and $args[0] -eq '-TestOpp') {
 
 # ---------------- GUI ----------------
 
+# 앱 아이콘은 스크립트에 내장 (base64) - 루트에 낱개 파일을 두지 않고 필요할 때 data\에 복원
+$script:IconB64 = 'AAABAAEAQEAQAAAAAABoCgAAFgAAACgAAABAAAAAgAAAAAEABAAAAAAAAAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACAAAAAgIAAgAAAAIAAgACAgAAAgICAAMDAwAAAAP8AAP8AAAD//wD/AAAA/wD/AP//AAD///8AAAAAAEZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmAAAAAAAARmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAAZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmdmZmAAAAZmeP////////////////////////////////h2ZgAARmf///////////////////////////////////dmQABmf////////////////////////////////////3ZgAGZ/////////////////////////////////////hmAEZo/////////////////////////////////////2ZARm//////////////////////////////////////dmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv//////////mZmZmZmZmZmZmZmV///////////2ZgZm//////////+ZmZmZmZmZmZmZmZX///////////ZmBmb//////////5mZmZmZmZmZmZmZlf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmP///4mY////+ZX///////////ZmBmb//////////5mY////iZj////5lf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmP///4mY////+ZX///////////ZmBmb//////////5mY////iZj////5lf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmZmZmZmZmZmZmZX///////////ZmBmb//////////5mZmZmZmZmZmZmZlf//////////9mYGZv//////////mZmZmZmZmZmZmZmV///////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBGaP////////////////////////////////////9mYAZo////////////////////////////////////+GZABmf////////////////////////////////////4ZgAGZo///////////////////////////////////4dmAABmeP/////////////////////////////////4dmQAAEZmeI//////////////////////////////iHdmYAAABGZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAABmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmAAAAAAAAAEZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/gAAAAAAAf/wAAAAAAAAf8AAAAAAAAAfgAAAAAAAAA+AAAAAAAAADwAAAAAAAAAHAAAAAAAAAAcAAAAAAAAABwAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAADAAAAAAAAAAMAAAAAAAAABwAAAAAAAAAHAAAAAAAAAAeAAAAAAAAAD8AAAAAAAAAP4AAAAAAAAD/wAAAAAAAAf/8AAAAAAAf///////////w=='
+
+# 바탕화면 바로가기 "작혼 오버레이" - 자체 빌드 exe를 거치지 않고 Windows 서명 powershell.exe를 직접 가리킴
+# (서명 없는 exe는 백신·스마트 앱 컨트롤에 막힐 수 있어, 바로가기는 막히지 않는 경로로 만든다)
+# .lnk는 IShellLinkW로 직접 씀 - WScript.Shell은 시스템 로캘이 한국어가 아니면 한글 경로가 깨질 수 있음
+# (필요할 때만 컴파일하고, 실패하면 WScript.Shell로 대체 - 이 부분 때문에 오버레이 시작이 막히는 일은 없게)
+$script:ShellLnkCs = @'
+using System; using System.Runtime.InteropServices;
+public static class ShellLnk {
+  [ComImport, Guid("00021401-0000-0000-C000-000000000046")] class CShellLink {}
+  [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+  interface IShellLinkW {
+    void GetPath(IntPtr pszFile, int cch, IntPtr pfd, uint fFlags);
+    void GetIDList(out IntPtr ppidl);
+    void SetIDList(IntPtr pidl);
+    void GetDescription(IntPtr pszName, int cch);
+    void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+    void GetWorkingDirectory(IntPtr pszDir, int cch);
+    void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
+    void GetArguments(IntPtr pszArgs, int cch);
+    void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
+    void GetHotkey(out short pwHotkey);
+    void SetHotkey(short wHotkey);
+    void GetShowCmd(out int piShowCmd);
+    void SetShowCmd(int iShowCmd);
+    void GetIconLocation(IntPtr pszIconPath, int cch, out int piIcon);
+    void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string pszIconPath, int iIcon);
+    void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, int dwReserved);
+    void Resolve(IntPtr hwnd, int fFlags);
+    void SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
+  }
+  public static void Write(string lnk, string target, string args, string dir, string icon, int showCmd, string desc) {
+    object o = new CShellLink();
+    try {
+      IShellLinkW l = (IShellLinkW)o;
+      l.SetPath(target); l.SetArguments(args); l.SetWorkingDirectory(dir);
+      l.SetIconLocation(icon, 0); l.SetShowCmd(showCmd); l.SetDescription(desc);
+      ((System.Runtime.InteropServices.ComTypes.IPersistFile)o).Save(lnk, true);
+    } finally { Marshal.ReleaseComObject(o); }
+  }
+}
+'@
+
+# 표식 파일 data\desktop-shortcut.done 에 바로가기를 만든 스크립트 경로를 적어 둠
+# -Auto (실행 때마다 호출): 표식 없음 → 새로 만듦 / 표식 있는데 바로가기 없음 → 사용자가 지운 것으로 보고 그대로 둠
+#                          바로가기 있는데 표식 경로가 지금과 다름(폴더 이동) → 현재 위치로 고쳐 씀
+# 반환: made(새로 만듦) / fixed(고쳐 씀) / ok(이미 최신) / skip(지운 것 존중)
+function Set-DesktopShortcut {
+    param([switch]$Auto)
+    $desk = [Environment]::GetFolderPath('Desktop')
+    if (-not $desk) { throw '바탕화면 폴더를 찾지 못했습니다.' }
+    $lnkPath = Join-Path $desk '작혼 오버레이.lnk'
+    $mark = Join-Path $script:DataDir 'desktop-shortcut.done'
+    $exists = Test-Path -LiteralPath $lnkPath
+    if ($Auto -and (Test-Path -LiteralPath $mark)) {
+        if (-not $exists) { return 'skip' }
+        $madeFor = ''
+        try { $madeFor = [IO.File]::ReadAllText($mark).Trim() } catch {}
+        if ($madeFor -eq $PSCommandPath) { return 'ok' }
+    }
+    $icoPath = Join-Path $script:DataDir 'overlay.ico'
+    if (-not (Test-Path -LiteralPath $icoPath)) { [IO.File]::WriteAllBytes($icoPath, [Convert]::FromBase64String($script:IconB64)) }
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $lnkArgs = '-NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '"'
+    $desc = '작혼 전적 검색 오버레이'
+    # 창 상태 7 = 최소화로 시작 - 콘솔 창 깜박임 억제 (곧바로 -WindowStyle Hidden이 숨김)
+    $written = $false
+    try {
+        if (-not ('ShellLnk' -as [type])) { Add-Type -TypeDefinition $script:ShellLnkCs -ErrorAction Stop }
+        [ShellLnk]::Write($lnkPath, $psExe, $lnkArgs, $script:BaseDir, $icoPath, 7, $desc)
+        $written = $true
+    } catch {}
+    if (-not $written) {
+        $sh = New-Object -ComObject WScript.Shell
+        try {
+            $lnk = $sh.CreateShortcut($lnkPath)
+            $lnk.TargetPath = $psExe
+            $lnk.Arguments = $lnkArgs
+            $lnk.WorkingDirectory = $script:BaseDir
+            $lnk.IconLocation = "$icoPath,0"
+            $lnk.WindowStyle = 7
+            $lnk.Description = $desc
+            $lnk.Save()
+        } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($sh) }
+    }
+    try { [IO.File]::WriteAllText($mark, $PSCommandPath) } catch {}
+    return $(if ($exists) { 'fixed' } else { 'made' })
+}
+
+# tools\desktop-shortcut.bat: 바로가기만 만들고 종료 (오버레이가 켜져 있어도 동작하도록 중복 실행 검사보다 앞)
+if ($args -contains '-MakeShortcut') {
+    try {
+        $null = Set-DesktopShortcut
+        $scMsg = "바탕화면에 '작혼 오버레이' 바로가기를 만들었습니다.`n이제 그 아이콘을 더블클릭하면 오버레이가 켜집니다."
+    } catch { $scMsg = "바로가기를 만들지 못했습니다.`n$($_.Exception.Message)" }
+    try {
+        Add-Type -AssemblyName PresentationFramework
+        $null = [System.Windows.MessageBox]::Show($scMsg, '작혼 오버레이')
+    } catch { Write-Host $scMsg }
+    exit 0
+}
+
 # 중복 실행 방지
 $script:InstanceMutex = New-Object Threading.Mutex($false, 'MajsoulOverlayMutex')
 if (-not $script:InstanceMutex.WaitOne(0)) { exit }
-
-# 앱 아이콘은 스크립트에 내장 (base64) - 루트에 낱개 파일을 두지 않고 필요할 때 data\에 복원
-$script:IconB64 = 'AAABAAEAQEAQAAAAAABoCgAAFgAAACgAAABAAAAAgAAAAAEABAAAAAAAAAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACAAAAAgIAAgAAAAIAAgACAgAAAgICAAMDAwAAAAP8AAP8AAAD//wD/AAAA/wD/AP//AAD///8AAAAAAEZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmAAAAAAAARmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAAZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmdmZmAAAAZmeP////////////////////////////////h2ZgAARmf///////////////////////////////////dmQABmf////////////////////////////////////3ZgAGZ/////////////////////////////////////hmAEZo/////////////////////////////////////2ZARm//////////////////////////////////////dmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv//////////mZmZmZmZmZmZmZmV///////////2ZgZm//////////+ZmZmZmZmZmZmZmZX///////////ZmBmb//////////5mZmZmZmZmZmZmZlf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmP///4mY////+ZX///////////ZmBmb//////////5mY////iZj////5lf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmP///4mY////+ZX///////////ZmBmb//////////5mY////iZj////5lf//////////9mYGZv//////////mZj///+JmP////mV///////////2ZgZm//////////+ZmZmZmZmZmZmZmZX///////////ZmBmb//////////5mZmZmZmZmZmZmZlf//////////9mYGZv//////////mZmZmZmZmZmZmZmV///////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv////////////////+JmP/////////////////2ZgZm/////////////////4mY//////////////////ZmBmb/////////////////iZj/////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBmb/////////////////////////////////////9mYGZv/////////////////////////////////////2ZgZm//////////////////////////////////////ZmBGaP////////////////////////////////////9mYAZo////////////////////////////////////+GZABmf////////////////////////////////////4ZgAGZo///////////////////////////////////4dmAABmeP/////////////////////////////////4dmQAAEZmeI//////////////////////////////iHdmYAAABGZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAABmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmAAAAAAAAAEZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/gAAAAAAAf/wAAAAAAAAf8AAAAAAAAAfgAAAAAAAAA+AAAAAAAAADwAAAAAAAAAHAAAAAAAAAAcAAAAAAAAABwAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAADAAAAAAAAAAMAAAAAAAAABwAAAAAAAAAHAAAAAAAAAAeAAAAAAAAAD8AAAAAAAAAP4AAAAAAAAD/wAAAAAAAAf/8AAAAAAAf///////////w=='
 
 # 실행용 EXE 자동 빌드 - 아이콘 박힌 진입점 (없을 때만, 윈도우 내장 csc 사용이라 별도 설치 불필요)
 try {
@@ -3241,6 +3341,9 @@ class SteamWrapper {
         }
     }
 } catch {}
+
+# 첫 실행 때 바탕화면 바로가기 자동 생성 (1회) - 지운 뒤 다시 만들려면 tools\desktop-shortcut.bat
+try { $null = Set-DesktopShortcut -Auto } catch {}
 
 # 갱신 중 UI 멈춤 방지: 비동기 HTTP + 메시지 펌프 활성화 (GUI 프로세스 전용)
 try {
